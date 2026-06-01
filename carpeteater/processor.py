@@ -1,0 +1,147 @@
+"""ffmpeg decode + WAV write + AudioProcessor thread.
+
+Decoding strategy:
+    Spawn ``ffmpeg -i <input> -ac 2 -ar 44100 -f f32le -`` and read stdout
+    into a numpy float32 array shaped (N, 2). Works for any format ffmpeg
+    can read.
+
+Output:
+    16-bit PCM WAV at 44.1 kHz written via soundfile next to the input,
+    with suffix ``_chewed.wav``.
+"""
+from __future__ import annotations
+
+import hashlib
+import subprocess
+from pathlib import Path
+
+import numpy as np
+import soundfile as sf
+from PySide6.QtCore import QObject, QThread, Signal
+
+from .resources import ffmpeg_path
+
+SAMPLE_RATE = 44100
+CHANNELS = 2
+
+
+class DecodeError(RuntimeError):
+    pass
+
+
+def decode_to_numpy(path: Path, sample_rate: int = SAMPLE_RATE,
+                   channels: int = CHANNELS) -> np.ndarray:
+    """Decode any audio file to float32 stereo numpy array via ffmpeg.
+
+    Returns shape ``(N, channels)`` in [-1, 1].
+    """
+    cmd = [
+        ffmpeg_path(),
+        "-hide_banner", "-loglevel", "error",
+        "-i", str(path),
+        "-ac", str(channels),
+        "-ar", str(sample_rate),
+        "-f", "f32le",
+        "-",
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except FileNotFoundError as e:
+        raise DecodeError(
+            f"ffmpeg not found at {ffmpeg_path()!r}. "
+            "Place ffmpeg.exe in vendor/ or on PATH."
+        ) from e
+
+    if proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", errors="replace").strip()
+        raise DecodeError(f"ffmpeg failed: {err or 'no stderr output'}")
+
+    raw = np.frombuffer(proc.stdout, dtype=np.float32)
+    if raw.size == 0:
+        raise DecodeError("ffmpeg produced empty output")
+    if raw.size % channels != 0:
+        # Trim partial frame.
+        raw = raw[: (raw.size // channels) * channels]
+    return raw.reshape(-1, channels).copy()
+
+
+def write_wav(path: Path, audio: np.ndarray, sample_rate: int = SAMPLE_RATE) -> None:
+    """Write a stereo (or mono) numpy float array as 16-bit PCM WAV."""
+    # Clip to [-1, 1] before quantization to avoid wraparound.
+    audio = np.clip(audio, -1.0, 1.0)
+    sf.write(str(path), audio, sample_rate, subtype="PCM_16")
+
+
+def output_path_for(input_path: Path) -> Path:
+    return input_path.with_name(f"{input_path.stem}_chewed.wav")
+
+
+def seed_for_file(path: Path) -> int:
+    """Deterministic 32-bit seed derived from the input path + size + mtime."""
+    h = hashlib.sha1()
+    h.update(str(path.resolve()).encode("utf-8", errors="replace"))
+    try:
+        st = path.stat()
+        h.update(str(st.st_size).encode())
+        h.update(str(int(st.st_mtime)).encode())
+    except OSError:
+        pass
+    return int.from_bytes(h.digest()[:4], "big") & 0x7FFFFFFF
+
+
+# --------------------------------------------------------------- QThread worker
+
+
+class AudioProcessor(QObject):
+    """Runs decode → DSP → write on a worker thread.
+
+    Signals:
+        finished(Path): output path written successfully.
+        failed(str): human-readable error message.
+    """
+
+    finished = Signal(object)  # Path
+    failed = Signal(str)
+
+    def __init__(self, input_path: Path, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self.input_path = input_path
+
+    def run(self) -> None:
+        try:
+            audio = decode_to_numpy(self.input_path)
+            # Lazy import so the GUI doesn't pay the DSP import cost at startup.
+            from .audio_fx import chew
+
+            seed = seed_for_file(self.input_path)
+            chewed = chew(audio, SAMPLE_RATE, seed=seed)
+            out = output_path_for(self.input_path)
+            write_wav(out, chewed)
+            self.finished.emit(out)
+        except DecodeError as e:
+            self.failed.emit(str(e))
+        except Exception as e:  # noqa: BLE001 — surface any DSP failure
+            self.failed.emit(f"{type(e).__name__}: {e}")
+
+
+def start_processor(input_path: Path, parent: QObject) -> tuple[QThread, AudioProcessor]:
+    """Construct a worker + thread and start it. Caller connects signals.
+
+    Returns ``(thread, worker)``. Caller should keep refs alive until
+    ``thread.finished`` fires.
+    """
+    thread = QThread(parent)
+    worker = AudioProcessor(input_path)
+    worker.moveToThread(thread)
+    thread.started.connect(worker.run)
+    worker.finished.connect(thread.quit)
+    worker.failed.connect(thread.quit)
+    thread.finished.connect(worker.deleteLater)
+    thread.finished.connect(thread.deleteLater)
+    thread.start()
+    return thread, worker
