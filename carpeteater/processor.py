@@ -141,19 +141,38 @@ class AudioProcessor(QObject):
             self.failed.emit(f"{type(e).__name__}: {e}")
 
 
-def start_processor(input_path: Path, parent: QObject) -> tuple[QThread, AudioProcessor]:
-    """Construct a worker + thread and start it. Caller connects signals.
+def start_processor(input_path: Path, parent: QObject,
+                    on_finished, on_failed) -> tuple[QThread, AudioProcessor]:
+    """Construct a worker + thread, wire signals, start it.
 
-    Returns ``(thread, worker)``. Caller should keep refs alive until
-    ``thread.finished`` fires.
+    All connections — including the caller's ``on_finished`` / ``on_failed``
+    slots — are made *before* the thread starts so a fast-finishing worker
+    cannot beat the connection setup.
+
+    Cleanup follows the Qt-recommended pattern: ``worker.deleteLater`` is
+    connected to the worker's own ``finished`` / ``failed`` signals (so it
+    runs while the worker's thread is still pumping events) and
+    ``thread.deleteLater`` is connected to ``thread.finished`` (so the
+    thread is reaped after its loop has stopped). The previous wiring —
+    ``thread.finished -> worker.deleteLater`` — queued the worker's
+    deletion on a thread whose event loop had already exited, leaving a
+    dangling QObject that occasionally crashed on later signal dispatch.
     """
     thread = QThread(parent)
     worker = AudioProcessor(input_path)
     worker.moveToThread(thread)
-    thread.started.connect(worker.run)
+
+    # User callbacks first.
+    worker.finished.connect(on_finished)
+    worker.failed.connect(on_failed)
+
+    # Cleanup chain.
     worker.finished.connect(thread.quit)
     worker.failed.connect(thread.quit)
-    thread.finished.connect(worker.deleteLater)
+    worker.finished.connect(worker.deleteLater)
+    worker.failed.connect(worker.deleteLater)
     thread.finished.connect(thread.deleteLater)
+
+    thread.started.connect(worker.run)
     thread.start()
     return thread, worker

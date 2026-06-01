@@ -7,6 +7,14 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- **Crash on finishing a chew.** The QThread cleanup chain queued `worker.deleteLater()` on a worker thread whose event loop had already stopped (`thread.finished -> worker.deleteLater`). The deletion event was never processed, leaving a dangling QObject that occasionally faulted on later signal dispatch. Switched to the Qt-recommended pattern: `worker.finished` / `worker.failed` -> `worker.deleteLater` (runs while the loop is still pumping events), `thread.finished` -> `thread.deleteLater` (reaps the thread after it stops).
+- `start_processor()` now wires the window's `on_finished` / `on_failed` slots *before* calling `thread.start()`, removing the race window where a fast worker could emit before the caller had connected.
+- `closeEvent` defends against the QThread C++ object having already been reaped via `deleteLater` while the Python wrapper is still live (would otherwise raise `RuntimeError: Internal C++ object already deleted`).
+
+### Added
+- **Crash log.** A global `sys.excepthook`, `sys.unraisablehook`, and Qt message handler are installed in `__main__.py`. Any unhandled Python exception, unraisable error, or Qt warning/critical/fatal is appended to `%LOCALAPPDATA%\CarpetEater\crash.log` with a timestamp, so future crashes leave evidence even when the app is launched via `pythonw.exe` or the bundled EXE (no console).
+
 ### Performance
 - **~17x DSP speedup.** A 3:49 audio file now chews in ~6 s instead of ~106 s.
   - `stage_comb` rewritten as a vectorized geometric expansion (`y[i] = x[i] + fb*y[i-D]` -> sum of `fb^k * shift(x, k*D)` until `fb^k` is below threshold). Killed the Python sample-by-sample loop.

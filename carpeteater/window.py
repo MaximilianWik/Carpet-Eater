@@ -292,9 +292,11 @@ class MouthWindow(QWidget):
         self._min_chew_timer.start(self._MIN_CHEW_MS)
         self.setToolTip(f"Chewing: {path.name}")
 
-        thread, worker = start_processor(path, self)
-        worker.finished.connect(self._on_worker_finished)
-        worker.failed.connect(self._on_worker_failed)
+        thread, worker = start_processor(
+            path, self,
+            on_finished=self._on_worker_finished,
+            on_failed=self._on_worker_failed,
+        )
         self._worker_thread = thread
         self._worker = worker
 
@@ -334,8 +336,17 @@ class MouthWindow(QWidget):
     # ---------------------------------------------------------------- close
     def closeEvent(self, event) -> None:
         # Wait briefly for any in-flight worker so we don't drop an output.
+        # The QThread C++ object may already be in deleteLater limbo even when
+        # our Python ref is still live — guard against the resulting
+        # RuntimeError ("Internal C++ object already deleted").
         thread = self._worker_thread
-        if thread is not None and thread.isRunning():
-            thread.quit()
-            thread.wait(2000)
+        self._worker_thread = None
+        self._worker = None
+        if thread is not None:
+            try:
+                if thread.isRunning():
+                    thread.quit()
+                    thread.wait(2000)
+            except RuntimeError:
+                pass  # already cleaned up by Qt
         super().closeEvent(event)
