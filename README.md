@@ -6,6 +6,8 @@ Drop an audio file into the open mouth. It chews. A horrifyingly distorted versi
 
 > Instagram: [@i.am.carpet.eater](https://www.instagram.com/i.am.carpet.eater/)
 > SoundCloud: [carpet_eater](https://soundcloud.com/carpet_eater)
+> Website: [carpet_loader.exe](https://carpeteater.net/)
+
 
 ---
 
