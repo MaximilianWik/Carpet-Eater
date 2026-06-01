@@ -1,0 +1,189 @@
+name: Build & Release
+
+# Triggers:
+#   push to main          → build and publish to a rolling "main" prerelease
+#   push of v* tag        → build and publish a numbered GitHub Release
+#   pull_request          → build only (no release)
+#   workflow_dispatch     → manual run
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+
+      - name: Determine version
+        id: version
+        shell: pwsh
+        run: |
+          $base = (Get-Content carpeteater/__init__.py | `
+                   Select-String '__version__\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          if ($env:GITHUB_REF -like 'refs/tags/v*') {
+            $tag    = $env:GITHUB_REF -replace 'refs/tags/v', ''
+            $public = $tag
+            $numeric = $tag
+            $isTag = 'true'
+          } else {
+            $sha     = $env:GITHUB_SHA.Substring(0, 7)
+            $public  = "$base-dev+$sha"
+            $numeric = $base
+            $isTag   = 'false'
+          }
+          "public=$public"   | Out-File -Append $env:GITHUB_OUTPUT
+          "numeric=$numeric" | Out-File -Append $env:GITHUB_OUTPUT
+          "is_tag=$isTag"    | Out-File -Append $env:GITHUB_OUTPUT
+          Write-Host "Public version : $public"
+          Write-Host "Numeric version: $numeric"
+          Write-Host "Tag build?     : $isTag"
+
+      - name: Install Python dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install "pyinstaller>=6.0"
+
+      - name: Cache ffmpeg
+        id: ffmpeg-cache
+        uses: actions/cache@v4
+        with:
+          path: vendor/ffmpeg.exe
+          key: ffmpeg-essentials-windows-v1
+
+      - name: Download ffmpeg
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force vendor | Out-Null
+          $url = 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip'
+          Write-Host "Downloading $url"
+          Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg-extracted
+          $exe = Get-ChildItem -Path ffmpeg-extracted -Filter ffmpeg.exe -Recurse | Select-Object -First 1
+          if (-not $exe) { throw "ffmpeg.exe not found in archive" }
+          Copy-Item $exe.FullName vendor\ffmpeg.exe
+          Remove-Item -Recurse -Force ffmpeg.zip, ffmpeg-extracted
+          Write-Host "ffmpeg.exe size: $((Get-Item vendor\ffmpeg.exe).Length) bytes"
+
+      - name: Generate icon
+        shell: pwsh
+        run: python make_icon.py
+
+      - name: Build EXE with PyInstaller
+        shell: pwsh
+        run: |
+          if (Test-Path build) { Remove-Item -Recurse -Force build }
+          if (Test-Path dist)  { Remove-Item -Recurse -Force dist }
+          pyinstaller --noconfirm --clean build.spec
+          if (-not (Test-Path dist\CarpetEater.exe)) { throw "PyInstaller did not produce dist\CarpetEater.exe" }
+          $size = (Get-Item dist\CarpetEater.exe).Length
+          Write-Host "Built dist\CarpetEater.exe ($size bytes)"
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          # Locate iscc (chocolatey may install to one of two paths).
+          $iscc = @(
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+            "${env:ProgramFiles}\Inno Setup 6\ISCC.exe"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) { throw "ISCC.exe not found after installation" }
+          Add-Content -Path $env:GITHUB_ENV -Value "ISCC=$iscc"
+          Write-Host "ISCC: $iscc"
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          & "$env:ISCC" `
+            "/DAppVersion=${{ steps.version.outputs.numeric }}" `
+            installer\carpeteater.iss
+          if (-not (Test-Path installer\Output\CarpetEater-Setup.exe)) {
+            throw "Installer not produced"
+          }
+          # Rename with version suffix for the release artifact.
+          Move-Item installer\Output\CarpetEater-Setup.exe `
+                    "installer\Output\CarpetEater-Setup-${{ steps.version.outputs.public }}.exe"
+          Get-ChildItem installer\Output
+
+      - name: Build portable zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force release | Out-Null
+          $zip = "release\CarpetEater-Portable-${{ steps.version.outputs.public }}.zip"
+          Compress-Archive -Path dist\CarpetEater.exe -DestinationPath $zip -Force
+          Get-Item $zip | Select-Object Name, Length
+
+      - name: Stage release artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force release | Out-Null
+          Copy-Item "installer\Output\CarpetEater-Setup-${{ steps.version.outputs.public }}.exe" release\
+          Copy-Item "installer\Output\CarpetEater-Setup-${{ steps.version.outputs.public }}.exe" `
+                    "release\CarpetEater-Setup.exe"
+          Copy-Item "release\CarpetEater-Portable-${{ steps.version.outputs.public }}.zip" `
+                    "release\CarpetEater-Portable.zip"
+          Get-ChildItem release
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: CarpetEater-${{ steps.version.outputs.public }}
+          path: release/
+          retention-days: 30
+
+      # ----------------------------------------------------- rolling main release
+      - name: Publish rolling main prerelease
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: rolling
+          name: "Rolling main build"
+          prerelease: true
+          make_latest: 'false'
+          body: |
+            Auto-built from the latest commit on `main`.
+
+            Version: `${{ steps.version.outputs.public }}`
+            Commit: ${{ github.sha }}
+
+            **For end users:** prefer the [latest stable release](https://github.com/${{ github.repository }}/releases/latest).
+          files: |
+            release/CarpetEater-Setup.exe
+            release/CarpetEater-Portable.zip
+            release/CarpetEater-Setup-${{ steps.version.outputs.public }}.exe
+            release/CarpetEater-Portable-${{ steps.version.outputs.public }}.zip
+
+      # -------------------------------------------------- numbered tagged release
+      - name: Publish tagged release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Carpet Eater ${{ github.ref_name }}"
+          generate_release_notes: true
+          make_latest: 'true'
+          files: |
+            release/CarpetEater-Setup.exe
+            release/CarpetEater-Portable.zip
+            release/CarpetEater-Setup-${{ steps.version.outputs.public }}.exe
+            release/CarpetEater-Portable-${{ steps.version.outputs.public }}.zip

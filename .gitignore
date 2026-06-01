@@ -23,7 +23,11 @@ dist/
 vendor/ffmpeg.exe
 vendor/ffprobe.exe
 
+# Inno Setup output
+installer/Output/
+
 # Test artifacts
 *_chewed.wav
 test_audio/
 scratch/
+Test/

@@ -5,6 +5,22 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Unreleased]
+
+### Added
+- `installer/carpeteater.iss` - Inno Setup script for a per-user installer (`%LOCALAPPDATA%\Programs\CarpetEater`, no admin required, sidesteps AppLocker on locked-down machines). Creates Start Menu entry, optional desktop shortcut, and uninstaller.
+- `.github/workflows/release.yml` - GitHub Actions pipeline that builds the EXE + installer + portable ZIP on every push:
+  - Push to `main` updates a rolling `rolling` prerelease (always the latest commit)
+  - Push of a `v*` tag creates a numbered GitHub Release marked as *latest*
+  - Pull requests build artifacts only, no release published
+  - Workflow caches ffmpeg between runs; uses `softprops/action-gh-release@v2`
+- Permanent download URLs via GitHub's `/releases/latest/download/<filename>` redirect, so external sites can link without ever updating the URL.
+
+### Changed
+- `README.md` - added a Download table at the top with installer / portable / rolling links; new *Installer* and *Releases* subsections under Build with `iscc` instructions and the tag-and-push release workflow.
+
+---
+
 ## [0.1.0] - 2026-06-01
 
 Initial release. Full project built from scratch.

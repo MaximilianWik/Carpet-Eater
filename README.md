@@ -9,6 +9,18 @@ Drop an audio file into the open mouth. It chews. A horrifyingly distorted versi
 
 ---
 
+## Download
+
+| | Link | What it is |
+|---|---|---|
+| **Installer** | [CarpetEater-Setup.exe](https://github.com/MaximilianWik/Carpet-Eater/releases/latest/download/CarpetEater-Setup.exe) | Per-user install (no admin). Adds Start Menu shortcut + uninstaller. |
+| **Portable** | [CarpetEater-Portable.zip](https://github.com/MaximilianWik/Carpet-Eater/releases/latest/download/CarpetEater-Portable.zip) | Single EXE, no install. Drop anywhere and run. |
+| **Latest dev** | [Rolling main build](https://github.com/MaximilianWik/Carpet-Eater/releases/tag/rolling) | Auto-built from the latest commit on `main`. |
+
+Both downloads are unsigned, so Windows SmartScreen will show *"Windows protected your PC"*. Click **More info → Run anyway**. Once.
+
+---
+
 ## What it is
 
 A frameless, transparent, mouth-shaped window that sits on top of your desktop. Drag any audio file onto it — the mouth opens, chews, and spits the file back out as `<name>_chewed.wav` in the same folder. The distortion is deterministic: the same file always produces the same output, as if the mouth has formed an opinion about it.
@@ -246,3 +258,37 @@ The bundled binary includes:
 - `vendor\ffmpeg.exe` resolved the same way.
 
 No install needed. Drop `CarpetEater.exe` anywhere and run it.
+
+### Installer (Inno Setup)
+
+`installer\carpeteater.iss` produces a per-user installer (`%LOCALAPPDATA%\Programs\CarpetEater`, no admin required). Build it locally with:
+
+```bat
+iscc installer\carpeteater.iss
+```
+
+Output: `installer\Output\CarpetEater-Setup.exe`. Requires [Inno Setup 6](https://jrsoftware.org/isdl.php) and an existing `dist\CarpetEater.exe`.
+
+---
+
+## Releases
+
+GitHub Actions builds the EXE, installer, and portable ZIP on every push:
+
+| Trigger | Result |
+|---|---|
+| Push to `main` | Builds artifacts, updates the [`rolling`](https://github.com/MaximilianWik/Carpet-Eater/releases/tag/rolling) prerelease (always the latest commit). |
+| Push of `v*` tag | Builds artifacts, creates a numbered GitHub Release tagged as *latest*. |
+| Pull request | Builds artifacts as workflow artifacts only — no release published. |
+
+Releasing a new stable version:
+
+```powershell
+# 1. Bump the version in carpeteater\__init__.py
+# 2. Update CHANGELOG.md
+# 3. Commit, tag, push:
+git tag v0.1.1
+git push origin main --tags
+```
+
+The download links at the top of this README point at `/releases/latest/download/...`, which always resolves to the most recent stable release — no website edits needed when a new version ships.
