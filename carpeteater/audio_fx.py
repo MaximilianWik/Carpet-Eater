@@ -1,19 +1,12 @@
 """Distortion DSP chain.
 
 All stages take and return float32 stereo numpy arrays of shape (N, 2)
-in [-1, 1]. The whole chain is deterministic given a seed, so the same
-file always produces the same chewed output.
+in [-1, 1]. The full ``chew`` pipeline is deterministic given a seed,
+so the same file always produces the same chewed output.
 
-Pipeline:
-    1. Pitch + speed mangle (resample, no formant correction)
-    2. Granular shuffle (50–200 ms grains, 20% reorder, occasional reverse)
-    3. Bitcrush (4–6 bits)
-    4. Sample-rate reduction with aliasing
-    5. Hard-clip waveshaper (tanh drive)
-    6. Ring modulator (30–120 Hz, 30% wet)
-    7. Comb-filter resonance (2–15 ms, fb 0.6)
-    8. Reverse-tail smear reverb
-    9. Random dropouts
+Multiple named chains are defined; ``chew()`` picks one at random per
+seed. Each chain has its own ordering and parameters so files come out
+sounding different from each other.
 
 Run from CLI:
     python -m carpeteater.audio_fx input.wav output.wav [--seed N]
@@ -23,6 +16,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 
@@ -47,9 +41,7 @@ def _normalize(x: np.ndarray, target: float = 0.95) -> np.ndarray:
 
 
 def _resample_linear(x: np.ndarray, ratio: float) -> np.ndarray:
-    """Linear-interpolation resample. ratio > 1 stretches (longer/lower-pitch
-    when used as a pitch shift the naive way; here we use it for length change).
-    Returns a stereo array."""
+    """Linear-interpolation resample. ``ratio`` > 1 stretches longer."""
     n_in = x.shape[0]
     n_out = max(1, int(round(n_in * ratio)))
     src_idx = np.linspace(0, n_in - 1, n_out, dtype=np.float64)
@@ -60,76 +52,119 @@ def _resample_linear(x: np.ndarray, ratio: float) -> np.ndarray:
     return out.astype(np.float32)
 
 
+def _comb_vectorized(x: np.ndarray, D: int, fb: float,
+                     threshold: float = 1e-4) -> np.ndarray:
+    """Vectorized feedback comb filter ``y[n] = x[n] + fb * y[n - D]``.
+
+    Computed as the geometric sum of fb^k * (x shifted by k*D) for k = 0, 1, ...
+    until fb^k drops below ``threshold``. With fb=0.6 this terminates after
+    ~18 iterations. With fb=0.95 it takes ~180. Far faster than a Python
+    sample-by-sample loop.
+    """
+    n = x.shape[0]
+    y = x.copy()
+    coeff = fb
+    k = 1
+    while abs(coeff) > threshold and k * D < n:
+        y[k * D:] += coeff * x[: n - k * D]
+        coeff *= fb
+        k += 1
+    return y
+
+
+def _one_pole_lp_fast(x: np.ndarray, a: float,
+                      tail_threshold: float = 1e-3) -> np.ndarray:
+    """Causal one-pole low-pass: ``y[n] = a * y[n-1] + (1-a) * x[n]``.
+
+    Implemented as a finite-impulse-response convolution against the
+    truncated geometric kernel ``(1-a) * a^k`` (taps until ``a^k`` is below
+    ``tail_threshold``). Pure numpy, no scipy dep.
+    """
+    if a <= 0.0:
+        return ((1 - a) * x).astype(np.float32)
+    K = max(1, int(np.ceil(np.log(tail_threshold) / np.log(a))))
+    K = min(K, x.shape[0])
+    h = (1.0 - a) * (a ** np.arange(K, dtype=np.float64))
+    n = x.shape[0]
+    out = np.empty_like(x)
+    for ch in range(x.shape[1]):
+        y = np.convolve(x[:, ch].astype(np.float64), h, mode="full")[:n]
+        out[:, ch] = y.astype(np.float32)
+    return out
+
+
 # ============================================================ stages
 
 
-def stage_pitch_speed(x: np.ndarray, rng: np.random.Generator) -> np.ndarray:
-    """Random pitch shift in semitones via resampling. Length changes too.
-
-    Range: -7 to +5 semitones (skewed slightly negative for "demon" feel).
-    """
-    semitones = float(rng.uniform(-7.0, 5.0))
+def stage_pitch_speed(x: np.ndarray, rng: np.random.Generator,
+                      lo: float = -7.0, hi: float = 5.0) -> np.ndarray:
+    """Random semitone shift via resampling. Length changes with pitch."""
+    semitones = float(rng.uniform(lo, hi))
     factor = 2.0 ** (semitones / 12.0)
-    # Resample by 1/factor: higher pitch = compressed = ratio < 1.
     return _resample_linear(x, 1.0 / factor)
 
 
 def stage_granular_shuffle(x: np.ndarray, sr: int,
-                            rng: np.random.Generator) -> np.ndarray:
-    """Slice into 50–200 ms grains, reorder ~20%, occasionally reverse."""
+                           rng: np.random.Generator,
+                           grain_lo_ms: float = 50.0,
+                           grain_hi_ms: float = 200.0,
+                           swap_frac: float = 0.20,
+                           reverse_frac: float = 0.10) -> np.ndarray:
+    """Slice into grains, swap a fraction of positions, reverse a fraction."""
     n = x.shape[0]
     if n < sr // 10:
         return x
-    grain_ms = float(rng.uniform(50.0, 200.0))
+    grain_ms = float(rng.uniform(grain_lo_ms, grain_hi_ms))
     grain_len = max(1, int(sr * grain_ms / 1000.0))
     indices = list(range(0, n, grain_len))
     grains = [x[i:i + grain_len] for i in indices]
 
-    # Pick 20% of grain positions to swap with a random other position.
-    n_swaps = max(1, int(len(grains) * 0.2))
+    n_swaps = max(1, int(len(grains) * swap_frac))
     for _ in range(n_swaps):
         a = int(rng.integers(0, len(grains)))
         b = int(rng.integers(0, len(grains)))
         grains[a], grains[b] = grains[b], grains[a]
 
-    # ~10% of grains get reversed.
     for i in range(len(grains)):
-        if rng.random() < 0.10:
+        if rng.random() < reverse_frac:
             grains[i] = grains[i][::-1]
 
-    # Apply a tiny crossfade between grains (3 ms) to avoid clicks.
     fade_len = min(int(sr * 0.003), grain_len // 4)
     if fade_len > 1:
         ramp = np.linspace(0.0, 1.0, fade_len, dtype=np.float32)[:, None]
         for i in range(1, len(grains)):
             cur = grains[i]
             if cur.shape[0] >= fade_len:
+                cur = cur.copy()
                 cur[:fade_len] = cur[:fade_len] * ramp
                 grains[i] = cur
         for i in range(len(grains) - 1):
             cur = grains[i]
             if cur.shape[0] >= fade_len:
+                cur = cur.copy()
                 cur[-fade_len:] = cur[-fade_len:] * (1.0 - ramp)
                 grains[i] = cur
 
     return np.concatenate(grains, axis=0).astype(np.float32)
 
 
-def stage_bitcrush(x: np.ndarray, rng: np.random.Generator) -> np.ndarray:
-    bits = int(rng.integers(4, 7))  # 4, 5, or 6
+def stage_bitcrush(x: np.ndarray, rng: np.random.Generator,
+                   bits_lo: int = 4, bits_hi: int = 6) -> np.ndarray:
+    bits = int(rng.integers(bits_lo, bits_hi + 1))
     levels = 2 ** (bits - 1)
     return (np.round(x * levels) / levels).astype(np.float32)
 
 
 def stage_sr_reduction(x: np.ndarray, sr: int,
-                        rng: np.random.Generator) -> np.ndarray:
-    """Decimate to 8–11 kHz (sample-and-hold) then upsample back."""
-    target = int(rng.integers(8000, 11001))
+                       rng: np.random.Generator,
+                       target_lo: int = 8000,
+                       target_hi: int = 11000) -> np.ndarray:
+    """Sample-and-hold decimation to a low rate, held back to the original."""
+    target = int(rng.integers(target_lo, target_hi + 1))
     factor = max(1, sr // target)
     if factor <= 1:
         return x
     n = x.shape[0]
-    # Sample-and-hold: take every Nth sample, repeat to original length.
     idx = (np.arange(n) // factor) * factor
     idx = np.minimum(idx, n - 1)
     return x[idx].astype(np.float32)
@@ -142,8 +177,10 @@ def stage_hard_clip(x: np.ndarray, drive_db: float = 18.0) -> np.ndarray:
 
 
 def stage_ring_mod(x: np.ndarray, sr: int,
-                    rng: np.random.Generator, mix: float = 0.30) -> np.ndarray:
-    freq = float(rng.uniform(30.0, 120.0))
+                   rng: np.random.Generator,
+                   freq_lo: float = 30.0, freq_hi: float = 120.0,
+                   mix: float = 0.30) -> np.ndarray:
+    freq = float(rng.uniform(freq_lo, freq_hi))
     n = x.shape[0]
     t = np.arange(n, dtype=np.float32) / sr
     car = np.sin(2.0 * np.pi * freq * t).astype(np.float32)[:, None]
@@ -151,56 +188,48 @@ def stage_ring_mod(x: np.ndarray, sr: int,
 
 
 def stage_comb(x: np.ndarray, sr: int,
-                rng: np.random.Generator, fb: float = 0.6) -> np.ndarray:
-    """Short feedback comb filter — metallic ringing.
-
-    y[n] = x[n] + fb * y[n - D]
-    """
-    delay_ms = float(rng.uniform(2.0, 15.0))
+               rng: np.random.Generator,
+               delay_lo_ms: float = 2.0, delay_hi_ms: float = 15.0,
+               fb: float = 0.6) -> np.ndarray:
+    """Short feedback comb filter for metallic ringing. Vectorized."""
+    delay_ms = float(rng.uniform(delay_lo_ms, delay_hi_ms))
     D = max(1, int(sr * delay_ms / 1000.0))
-    n = x.shape[0]
-    y = x.copy()
-    # Process per-channel; vectorize across channels.
-    for i in range(D, n):
-        y[i] = x[i] + fb * y[i - D]
+    y = _comb_vectorized(x, D, fb)
     return _normalize(y, 0.95)
 
 
 def stage_reverse_smear(x: np.ndarray, sr: int,
-                         rng: np.random.Generator,
-                         mix: float = 0.25) -> np.ndarray:
-    """Fake reverse-tail reverb: reverse, low-pass smear, reverse, mix in."""
-    rev = x[::-1].copy()
-    # One-pole low-pass smear.
-    a = 0.92
-    smear = np.empty_like(rev)
-    smear[0] = rev[0]
-    for i in range(1, rev.shape[0]):
-        smear[i] = a * smear[i - 1] + (1.0 - a) * rev[i]
+                        rng: np.random.Generator,
+                        a: float = 0.92, mix: float = 0.25,
+                        pre_delay_s: float = 0.04) -> np.ndarray:
+    """Fake reverse-tail reverb via fast vectorized one-pole low-pass."""
+    rev = np.ascontiguousarray(x[::-1])
+    smear = _one_pole_lp_fast(rev, a)
     tail = smear[::-1]
-    # Slight delay so the tail leads the dry hit.
-    delay = int(sr * 0.04)
-    if delay > 0 and delay < x.shape[0]:
+
+    delay = int(sr * pre_delay_s)
+    if 0 < delay < x.shape[0]:
         padded = np.zeros_like(tail)
         padded[delay:] = tail[: tail.shape[0] - delay]
         tail = padded
+
     return ((1.0 - mix) * x + mix * tail).astype(np.float32)
 
 
 def stage_dropouts(x: np.ndarray, sr: int,
-                    rng: np.random.Generator) -> np.ndarray:
-    """Mute 20–80 ms windows at ~2 Hz."""
+                   rng: np.random.Generator,
+                   win_lo_ms: float = 20.0, win_hi_ms: float = 80.0,
+                   rate_hz: float = 2.0) -> np.ndarray:
     n = x.shape[0]
     duration_s = n / sr
-    n_drops = max(1, int(duration_s * 2.0))
+    n_drops = max(1, int(duration_s * rate_hz))
     y = x.copy()
     for _ in range(n_drops):
-        win_ms = float(rng.uniform(20.0, 80.0))
+        win_ms = float(rng.uniform(win_lo_ms, win_hi_ms))
         win = max(1, int(sr * win_ms / 1000.0))
         if n - win <= 0:
             continue
         start = int(rng.integers(0, n - win))
-        # Quick fade in/out on the dropout edges to avoid clicks.
         edge = min(64, win // 4)
         ramp = np.linspace(1.0, 0.0, edge, dtype=np.float32)[:, None]
         y[start:start + edge] *= ramp
@@ -210,17 +239,15 @@ def stage_dropouts(x: np.ndarray, sr: int,
     return y
 
 
-# ============================================================ pipeline
+# ============================================================ chains
+#
+# Each chain is a function (audio, sr, rng) -> audio.
+# All take a *single* rng so the seed fully determines the output.
 
 
-def chew(audio: np.ndarray, sr: int = 44100, seed: int | None = None) -> np.ndarray:
-    """Apply the full distortion chain. Deterministic given ``seed``."""
-    if seed is None:
-        seed = int(np.random.SeedSequence().entropy & 0x7FFFFFFF)
-    rng = np.random.default_rng(seed)
-
-    x = _ensure_stereo(audio)
-
+def chain_standard_mauling(x: np.ndarray, sr: int,
+                           rng: np.random.Generator) -> np.ndarray:
+    """The full nine-stage chain. Heavy and balanced."""
     x = stage_pitch_speed(x, rng)
     x = stage_granular_shuffle(x, sr, rng)
     x = stage_bitcrush(x, rng)
@@ -230,8 +257,103 @@ def chew(audio: np.ndarray, sr: int = 44100, seed: int | None = None) -> np.ndar
     x = stage_comb(x, sr, rng, fb=0.6)
     x = stage_reverse_smear(x, sr, rng, mix=0.25)
     x = stage_dropouts(x, sr, rng)
+    return x
 
-    return _normalize(x, 0.95)
+
+def chain_wet_slobber(x: np.ndarray, sr: int,
+                      rng: np.random.Generator) -> np.ndarray:
+    """Drowning, smeared, lots of reverb, less granular destruction."""
+    x = stage_pitch_speed(x, rng, lo=-9.0, hi=2.0)         # darker
+    x = stage_bitcrush(x, rng, bits_lo=5, bits_hi=7)        # gentler crush
+    x = stage_sr_reduction(x, sr, rng, target_lo=10000, target_hi=14000)
+    x = stage_hard_clip(x, drive_db=10.0)                   # less aggressive
+    x = stage_reverse_smear(x, sr, rng, a=0.95, mix=0.55,   # heavy smear
+                            pre_delay_s=0.08)
+    x = stage_comb(x, sr, rng, delay_lo_ms=12.0, delay_hi_ms=30.0, fb=0.5)
+    x = stage_dropouts(x, sr, rng, win_lo_ms=10.0, win_hi_ms=40.0, rate_hz=1.0)
+    return x
+
+
+def chain_bone_grinder(x: np.ndarray, sr: int,
+                       rng: np.random.Generator) -> np.ndarray:
+    """Metallic, abrasive, no smear, heavy comb + clip."""
+    x = stage_pitch_speed(x, rng, lo=-3.0, hi=7.0)          # brighter
+    x = stage_granular_shuffle(x, sr, rng, swap_frac=0.10, reverse_frac=0.05)
+    x = stage_bitcrush(x, rng, bits_lo=3, bits_hi=5)        # harsher
+    x = stage_hard_clip(x, drive_db=22.0)                   # heavy drive
+    x = stage_ring_mod(x, sr, rng, freq_lo=80.0, freq_hi=240.0, mix=0.45)
+    x = stage_comb(x, sr, rng, delay_lo_ms=1.0, delay_hi_ms=6.0, fb=0.75)
+    x = stage_dropouts(x, sr, rng, win_lo_ms=10.0, win_hi_ms=30.0, rate_hz=3.0)
+    return x
+
+
+def chain_pulper(x: np.ndarray, sr: int,
+                 rng: np.random.Generator) -> np.ndarray:
+    """Granular shuffle dominant. Lots of stutter, no smear, no comb."""
+    x = stage_granular_shuffle(x, sr, rng, grain_lo_ms=20.0, grain_hi_ms=100.0,
+                               swap_frac=0.45, reverse_frac=0.25)
+    x = stage_pitch_speed(x, rng, lo=-5.0, hi=5.0)
+    x = stage_granular_shuffle(x, sr, rng, grain_lo_ms=80.0, grain_hi_ms=300.0,
+                               swap_frac=0.35, reverse_frac=0.15)
+    x = stage_bitcrush(x, rng, bits_lo=5, bits_hi=7)
+    x = stage_ring_mod(x, sr, rng, freq_lo=40.0, freq_hi=160.0, mix=0.20)
+    x = stage_hard_clip(x, drive_db=12.0)
+    x = stage_dropouts(x, sr, rng, win_lo_ms=30.0, win_hi_ms=150.0, rate_hz=4.0)
+    return x
+
+
+def chain_stomach_acid(x: np.ndarray, sr: int,
+                       rng: np.random.Generator) -> np.ndarray:
+    """Maximum digital decay. Extreme bitcrush + SR reduction + dropouts."""
+    x = stage_bitcrush(x, rng, bits_lo=2, bits_hi=4)        # brutal
+    x = stage_sr_reduction(x, sr, rng, target_lo=4000, target_hi=8000)
+    x = stage_hard_clip(x, drive_db=20.0)
+    x = stage_ring_mod(x, sr, rng, freq_lo=60.0, freq_hi=180.0, mix=0.35)
+    x = stage_comb(x, sr, rng, delay_lo_ms=4.0, delay_hi_ms=12.0, fb=0.7)
+    x = stage_dropouts(x, sr, rng, win_lo_ms=40.0, win_hi_ms=120.0, rate_hz=2.5)
+    x = stage_reverse_smear(x, sr, rng, a=0.88, mix=0.20)
+    return x
+
+
+# Registry: name -> function. Order doesn't matter; selection is random.
+CHAINS: dict[str, Callable[[np.ndarray, int, np.random.Generator], np.ndarray]] = {
+    "standard_mauling": chain_standard_mauling,
+    "wet_slobber":      chain_wet_slobber,
+    "bone_grinder":     chain_bone_grinder,
+    "pulper":           chain_pulper,
+    "stomach_acid":     chain_stomach_acid,
+}
+
+
+# ============================================================ pipeline
+
+
+def chew(audio: np.ndarray, sr: int = 44100,
+         seed: int | None = None,
+         chain: str | None = None) -> tuple[str, np.ndarray]:
+    """Apply a randomly-chosen DSP chain. Deterministic given ``seed``.
+
+    Returns ``(chain_name, audio)``. Pass ``chain=name`` to force a chain.
+    """
+    if seed is None:
+        seed = int(np.random.SeedSequence().entropy & 0x7FFFFFFF)
+
+    # Use a SeedSequence so the chain choice and DSP randomness are independent.
+    ss = np.random.SeedSequence(seed)
+    chain_seed, dsp_seed = ss.generate_state(2, dtype=np.uint32)
+
+    if chain is None:
+        chain_rng = np.random.default_rng(int(chain_seed))
+        names = sorted(CHAINS.keys())
+        chain = names[int(chain_rng.integers(0, len(names)))]
+    elif chain not in CHAINS:
+        raise ValueError(f"unknown chain {chain!r}; available: {list(CHAINS)}")
+
+    rng = np.random.default_rng(int(dsp_seed))
+    x = _ensure_stereo(audio)
+    x = CHAINS[chain](x, sr, rng)
+    x = _normalize(x, 0.95)
+    return chain, x
 
 
 # ============================================================ CLI
@@ -240,21 +362,29 @@ def chew(audio: np.ndarray, sr: int = 44100, seed: int | None = None) -> np.ndar
 def _cli(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m carpeteater.audio_fx",
-        description="Apply the Carpet Eater DSP chain to an audio file.",
+        description="Apply a Carpet Eater DSP chain to an audio file.",
     )
     parser.add_argument("input", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--seed", type=int, default=None,
                         help="Deterministic seed (default: derived from file).")
+    parser.add_argument("--chain", choices=sorted(CHAINS.keys()), default=None,
+                        help="Force a specific chain (default: random per seed).")
+    parser.add_argument("--list-chains", action="store_true")
     args = parser.parse_args(argv)
 
-    # Local imports so importing audio_fx as a library doesn't drag these in.
+    if args.list_chains:
+        for name in sorted(CHAINS):
+            print(name)
+        return 0
+
     from .processor import decode_to_numpy, seed_for_file, write_wav
 
     audio = decode_to_numpy(args.input)
     seed = args.seed if args.seed is not None else seed_for_file(args.input)
     print(f"chewing {args.input} (seed={seed}, frames={audio.shape[0]})")
-    chewed = chew(audio, sr=44100, seed=seed)
+    chain_name, chewed = chew(audio, sr=44100, seed=seed, chain=args.chain)
+    print(f"chain: {chain_name}")
     write_wav(args.output, chewed)
     print(f"wrote {args.output} ({chewed.shape[0]} frames)")
     return 0

@@ -7,16 +7,40 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Performance
+- **~17x DSP speedup.** A 3:49 audio file now chews in ~6 s instead of ~106 s.
+  - `stage_comb` rewritten as a vectorized geometric expansion (`y[i] = x[i] + fb*y[i-D]` -> sum of `fb^k * shift(x, k*D)` until `fb^k` is below threshold). Killed the Python sample-by-sample loop.
+  - `stage_reverse_smear` rewritten using `np.convolve` against a truncated geometric kernel for the one-pole low-pass. Same audible result, no scipy dependency.
+
 ### Added
-- `installer/carpeteater.iss` - Inno Setup script for a per-user installer (`%LOCALAPPDATA%\Programs\CarpetEater`, no admin required, sidesteps AppLocker on locked-down machines). Creates Start Menu entry, optional desktop shortcut, and uninstaller.
-- `.github/workflows/release.yml` - GitHub Actions pipeline that builds the EXE + installer + portable ZIP on every push:
-  - Push to `main` updates a rolling `rolling` prerelease (always the latest commit)
-  - Push of a `v*` tag creates a numbered GitHub Release marked as *latest*
-  - Pull requests build artifacts only, no release published
-  - Workflow caches ffmpeg between runs; uses `softprops/action-gh-release@v2`
-- Permanent download URLs via GitHub's `/releases/latest/download/<filename>` redirect, so external sites can link without ever updating the URL.
+- **Multiple DSP chains, picked at random per file.** `audio_fx.CHAINS` registry with five named chains:
+  - `standard_mauling` - the original 9-stage chain
+  - `wet_slobber` - dark, drowning, heavy reverse-smear, less granular destruction
+  - `bone_grinder` - metallic and abrasive, heavy comb + clip, no smear
+  - `pulper` - granular shuffle dominant, lots of stutter
+  - `stomach_acid` - extreme bitcrush + sample-rate reduction, maximum digital decay
+- `chew()` now returns `(chain_name, audio)` so callers can know which chain was used. Chain selection is deterministic per seed and uses an independent sub-stream from the DSP randomness.
+- `--chain NAME` and `--list-chains` flags on the CLI.
+- **Filename escalation - `carpeteater/naming.py`.**
+  - First chew: `song.mp3` -> `song_chewed - tasted NN WORD!!!.wav`
+  - Re-chew: `song_chewed.wav` -> `song_incestuous_chewed - tasted NN WORD!!!.wav`
+  - Further re-chews stack adjectives: `song_incestuous_putrid_chewed`, `song_putrid_incestuous_necrotic_chewed`, etc.
+  - Adjective pool: 20 visceral words; the picker avoids ones already present in the stem.
+  - Tasting note pool: ~38 words including a few rare easter eggs ("DELICIOUS", "EXQUISITE").
+  - Any prior `" - tasted NN WORD!!!"` suffix is stripped before re-tasting, so the suffix only ever describes the most recent chew.
+  - Naming uses an independent sub-seed - changing DSP randomness will not change the filename.
+- **Installer + CI release pipeline.**
+  - `installer/carpeteater.iss` - Inno Setup script for a per-user installer (`%LOCALAPPDATA%\Programs\CarpetEater`, no admin required, sidesteps AppLocker on locked-down machines). Creates Start Menu entry, optional desktop shortcut, and uninstaller.
+  - `.github/workflows/release.yml` - GitHub Actions pipeline that builds the EXE + installer + portable ZIP on every push:
+    - Push to `main` updates a rolling `rolling` prerelease (always the latest commit)
+    - Push of a `v*` tag creates a numbered GitHub Release marked as *latest*
+    - Pull requests build artifacts only, no release published
+    - Workflow caches ffmpeg between runs; uses `softprops/action-gh-release@v2`
+  - Permanent download URLs via GitHub's `/releases/latest/download/<filename>` redirect, so external sites can link without ever updating the URL.
 
 ### Changed
+- `processor.py` derives three independent sub-streams from the file seed (chain selection, DSP randomness, naming) via `numpy.random.SeedSequence`, so swapping any one will not perturb the others.
+- `AudioProcessor.chain_name` exposes which chain was used after `run()` succeeds (for future UI hooks).
 - `README.md` - added a Download table at the top with installer / portable / rolling links; new *Installer* and *Releases* subsections under Build with `iscc` instructions and the tag-and-push release workflow.
 
 ---

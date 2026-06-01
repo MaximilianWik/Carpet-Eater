@@ -6,8 +6,9 @@ Decoding strategy:
     can read.
 
 Output:
-    16-bit PCM WAV at 44.1 kHz written via soundfile next to the input,
-    with suffix ``_chewed.wav``.
+    16-bit PCM WAV at 44.1 kHz written via soundfile next to the input.
+    Filename is mangled by :mod:`carpeteater.naming` — escalating ``_chewed``
+    prefix and a ``" - tasted NN WORD!!!"`` suffix.
 """
 from __future__ import annotations
 
@@ -77,8 +78,10 @@ def write_wav(path: Path, audio: np.ndarray, sample_rate: int = SAMPLE_RATE) -> 
     sf.write(str(path), audio, sample_rate, subtype="PCM_16")
 
 
-def output_path_for(input_path: Path) -> Path:
-    return input_path.with_name(f"{input_path.stem}_chewed.wav")
+def output_path_for(input_path: Path, rng: np.random.Generator) -> Path:
+    """Compute the chewed-output filename. See :mod:`carpeteater.naming`."""
+    from .naming import output_path_for as _name
+    return _name(input_path, rng)
 
 
 def seed_for_file(path: Path) -> int:
@@ -98,7 +101,7 @@ def seed_for_file(path: Path) -> int:
 
 
 class AudioProcessor(QObject):
-    """Runs decode → DSP → write on a worker thread.
+    """Runs decode -> DSP -> write on a worker thread.
 
     Signals:
         finished(Path): output path written successfully.
@@ -111,16 +114,25 @@ class AudioProcessor(QObject):
     def __init__(self, input_path: Path, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self.input_path = input_path
+        self.chain_name: str | None = None  # set after run() succeeds
 
     def run(self) -> None:
         try:
             audio = decode_to_numpy(self.input_path)
-            # Lazy import so the GUI doesn't pay the DSP import cost at startup.
+            # Lazy imports so the GUI doesn't pay the DSP cost at startup.
             from .audio_fx import chew
 
             seed = seed_for_file(self.input_path)
-            chewed = chew(audio, SAMPLE_RATE, seed=seed)
-            out = output_path_for(self.input_path)
+            # Three independent sub-streams: chain selection (inside chew),
+            # DSP randomness (inside chew), and output naming (here).
+            ss = np.random.SeedSequence(seed)
+            naming_seed = int(ss.spawn(1)[0].generate_state(1, dtype=np.uint32)[0])
+            naming_rng = np.random.default_rng(naming_seed)
+
+            chain_name, chewed = chew(audio, SAMPLE_RATE, seed=seed)
+            self.chain_name = chain_name
+
+            out = output_path_for(self.input_path, naming_rng)
             write_wav(out, chewed)
             self.finished.emit(out)
         except DecodeError as e:
