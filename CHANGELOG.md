@@ -13,6 +13,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `__main__.py` now sets up logging *before* the excepthook + Qt message handler, so unhandled Python exceptions, unraisable errors, and Qt warnings/criticals/fatals all flow to the same file.
 
 ### Fixed
+- **Root cause of the end-of-chew crash: toggling Always-on-top mid-chew.** Qt's `setWindowFlags()` recreates the native HWND on Windows (destroys, rebuilds, re-shows the window). When done while a worker thread had queued events targeting the widget and active QTimers parented to it, Qt's state went briefly inconsistent and the spit-transition path eventually crashed. Replaced the toggle with a direct Win32 `SetWindowPos(HWND_TOPMOST | HWND_NOTOPMOST)` call via ctypes — flips just the `WS_EX_TOPMOST` bit on the existing HWND, no recreation. Initial flag setup (only called once, before show) still uses `setWindowFlags()`.
 - **Defensive guards on the post-chew code path.** `paintEvent`, `_finish_chew`, `_on_state_changed`, `_start_jitter`, and `_tick_jitter` now wrap their body in try/except so a single Python-level exception in the post-finish sequence cannot take the process down silently. The exception is logged (and visible in the log file) instead of disappearing into Qt's event dispatch.
 - `paintEvent` also null-checks both the source `QPixmap` and the scaled result before drawing, and uses `try/finally` around the `QPainter` lifetime so it always calls `end()`.
 

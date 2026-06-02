@@ -5,6 +5,7 @@ animator. Accepts audio file drops. Owns the AudioProcessor thread.
 """
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 from PySide6.QtCore import QPoint, QPointF, QSize, Qt, QTimer, QUrl
@@ -85,6 +86,7 @@ class MouthWindow(QWidget):
         self._worker = None
         self._chew_started_at: float = 0.0
         self._pending_result: tuple[bool, Path | str] | None = None
+        self._pending_flag_apply: bool = False
         self._min_chew_timer = QTimer(self)
         self._min_chew_timer.setSingleShot(True)
         self._min_chew_timer.timeout.connect(self._maybe_finalize)
@@ -94,6 +96,12 @@ class MouthWindow(QWidget):
 
     # ----------------------------------------------------------------- flags
     def _apply_window_flags(self) -> None:
+        """Initial flag setup. Only safe to call before ``show()`` — calling
+        ``setWindowFlags()`` on a visible window recreates the native HWND on
+        Windows, which corrupts Qt's state when a worker thread has queued
+        events targeting the widget. Use :py:meth:`_set_topmost_native` for
+        runtime toggling instead.
+        """
         flags = Qt.FramelessWindowHint | Qt.Tool
         if self._always_on_top:
             flags |= Qt.WindowStaysOnTopHint
@@ -101,6 +109,41 @@ class MouthWindow(QWidget):
         self.setWindowFlags(flags)
         if was_visible:
             self.show()
+
+    def _set_topmost_native(self, on: bool) -> bool:
+        """Flip ``WS_EX_TOPMOST`` on the existing HWND via Win32.
+
+        Returns True on success. Avoids the Qt setWindowFlags() path which
+        destroys and re-creates the native window — that recreation, when it
+        happens mid-chew, is what was crashing the app at the end of a run.
+        """
+        if sys.platform != "win32":
+            return False
+        try:
+            import ctypes
+            HWND_TOPMOST = -1
+            HWND_NOTOPMOST = -2
+            SWP_NOMOVE = 0x0002
+            SWP_NOSIZE = 0x0001
+            SWP_NOACTIVATE = 0x0010
+            user32 = ctypes.windll.user32
+            user32.SetWindowPos.restype = ctypes.c_bool
+            user32.SetWindowPos.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                ctypes.c_uint,
+            ]
+            hwnd = int(self.winId())
+            flag = HWND_TOPMOST if on else HWND_NOTOPMOST
+            ok = bool(user32.SetWindowPos(
+                hwnd, flag, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            ))
+            _log.info("SetWindowPos topmost=%s -> %s", on, ok)
+            return ok
+        except Exception:
+            _log.exception("SetWindowPos failed")
+            return False
 
     def _center_on_screen(self) -> None:
         screen = QGuiApplication.primaryScreen()
@@ -128,6 +171,9 @@ class MouthWindow(QWidget):
         try:
             if state is MouthState.SPITTING:
                 self._start_jitter()
+            elif state is MouthState.IDLE and self._pending_flag_apply:
+                self._pending_flag_apply = False
+                self._apply_window_flags()
         except Exception:
             _log.exception("error in _on_state_changed")
 
@@ -258,7 +304,21 @@ class MouthWindow(QWidget):
         menu.exec(global_pos)
 
     def _toggle_always_on_top(self, on: bool) -> None:
+        _log.info("toggle always-on-top: %s (state=%s)",
+                  on, self._animator.state.name)
         self._always_on_top = on
+        # Use the Win32 path so the native HWND is *not* recreated. The
+        # previous setWindowFlags-based toggle would tear down and rebuild
+        # the HWND, which crashed the app when triggered mid-chew (queued
+        # events from the worker thread landed on a transient state).
+        if self._set_topmost_native(on):
+            return
+        # Fallback for non-Windows hosts (or if SetWindowPos refused).
+        # Only safe when the chew has finished, so defer if still busy.
+        if self._animator.state in (MouthState.CHEWING, MouthState.SPITTING):
+            _log.warning("native toggle unavailable; deferring until IDLE")
+            self._pending_flag_apply = True
+            return
         self._apply_window_flags()
 
     # ------------------------------------------------------- drag and drop
