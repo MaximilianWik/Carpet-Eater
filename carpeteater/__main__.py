@@ -12,7 +12,7 @@ import logging
 import sys
 import traceback
 
-from PySide6.QtCore import qInstallMessageHandler, QtMsgType
+from PySide6.QtCore import QtMsgType, qInstallMessageHandler
 from PySide6.QtWidgets import QApplication
 
 from . import log
@@ -29,9 +29,9 @@ def _install_excepthook() -> None:
     sys.excepthook = hook
 
     def unraisable(args):  # noqa: ANN001 — sys.unraisablehook signature
-        msg = "".join(
-            traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback)
-        )
+        msg = "".join(traceback.format_exception(
+            args.exc_type, args.exc_value, args.exc_traceback,
+        ))
         crash_log.error("unraisable in %r:\n%s", args.object, msg)
     sys.unraisablehook = unraisable
 

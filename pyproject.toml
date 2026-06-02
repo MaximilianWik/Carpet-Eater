@@ -1,0 +1,26 @@
+[project]
+name = "carpeteater"
+version = "0.1.0"
+description = "Desktop mouth that chews audio files"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+authors = [
+    { name = "Maximilian Wikström" },
+]
+dependencies = [
+    "PySide6>=6.6",
+    "numpy>=1.26",
+    "soundfile>=0.12",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["F", "E", "W", "UP", "B", "SIM", "I"]
+ignore = [
+    # Long lines in docstrings — readability beats arbitrary col limits.
+    "E501",
+]

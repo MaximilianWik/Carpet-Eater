@@ -2,9 +2,9 @@
 
 Each chew escalates the input filename:
 
-    song.mp3                            -> song_chewed - tasted 47 GAMEY!!!.wav
-    song_chewed.wav                     -> song_incestuous_chewed - tasted 12 PUTRID!!!.wav
-    song_incestuous_chewed.wav          -> song_putrid_incestuous_chewed - tasted 89 RANCID!!!.wav
+    song.mp3                       ->  song_chewed - tasted 47 GAMEY!!!.wav
+    song_chewed.wav                ->  song_incestuous_chewed - tasted 12 PUTRID!!!.wav
+    song_incestuous_chewed.wav     ->  song_putrid_incestuous_chewed - tasted 89 RANCID!!!.wav
 
 Rules:
     * Any pre-existing ``" - tasted NN WORD!!!"`` suffix on the stem is

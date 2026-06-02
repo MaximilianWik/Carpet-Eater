@@ -13,6 +13,9 @@ build/
 dist/
 *.spec.bak
 
+# Generated at build time
+build_icon.ico
+
 # IDE
 .vscode/
 .idea/

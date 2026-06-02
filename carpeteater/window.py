@@ -8,11 +8,10 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QPoint, QPointF, QSize, Qt, QTimer, QUrl
+from PySide6.QtCore import QPoint, Qt, QTimer, QUrl
 from PySide6.QtGui import (
     QAction,
     QColor,
-    QCursor,
     QDragEnterEvent,
     QDragLeaveEvent,
     QDropEvent,
@@ -26,10 +25,10 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QMenu, QWidget
 
+from . import log
 from .animator import MouthAnimator, MouthState
 from .processor import start_processor
 from .resources import open_in_explorer, sprite_path
-from . import log
 
 _log = log.get_logger("carpeteater.window")
 
@@ -248,7 +247,8 @@ class MouthWindow(QWidget):
     # ----------------------------------------------------------- mouse drag
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.LeftButton:
-            self._drag_anchor = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            global_pos = event.globalPosition().toPoint()
+            self._drag_anchor = global_pos - self.frameGeometry().topLeft()
             event.accept()
         elif event.button() == Qt.RightButton:
             self._show_context_menu(event.globalPosition().toPoint())
