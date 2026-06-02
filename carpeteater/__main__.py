@@ -1,78 +1,72 @@
 """Entry point: ``python -m carpeteater``.
 
-Installs a global excepthook so unhandled exceptions are written to
-``%LOCALAPPDATA%\\CarpetEater\\crash.log`` before the process dies.
-Without this, the windowed pythonw.exe / PyInstaller build silently
-swallows tracebacks and the user sees only "the mouth disappeared".
+Sets up file logging to ``%LOCALAPPDATA%\\CarpetEater\\carpet-eater.log``
+before anything else, so unhandled exceptions, unraisable errors, and
+Qt warnings all flow into the same file. Without this, a windowed
+pythonw.exe / PyInstaller build silently swallows tracebacks and the
+user only sees "the mouth disappeared".
 """
 from __future__ import annotations
 
-import os
+import logging
 import sys
 import traceback
-from datetime import datetime
-from pathlib import Path
 
 from PySide6.QtCore import qInstallMessageHandler, QtMsgType
 from PySide6.QtWidgets import QApplication
 
+from . import log
 from .window import MouthWindow
 
 
-def _crash_log_path() -> Path:
-    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-    folder = Path(base) / "CarpetEater"
-    folder.mkdir(parents=True, exist_ok=True)
-    return folder / "crash.log"
-
-
-def _write_crash(prefix: str, message: str) -> None:
-    try:
-        path = _crash_log_path()
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(f"\n=== {datetime.now().isoformat()} | {prefix} ===\n")
-            f.write(message)
-            f.write("\n")
-    except Exception:
-        # Last resort — never let logging itself crash the process.
-        pass
-
-
 def _install_excepthook() -> None:
+    crash_log = logging.getLogger("carpeteater.crash")
+
     def hook(exc_type, exc_value, tb) -> None:
         msg = "".join(traceback.format_exception(exc_type, exc_value, tb))
-        _write_crash("python excepthook", msg)
-        # Still print to stderr in case we're running from a console.
+        crash_log.error("unhandled exception:\n%s", msg)
         sys.__excepthook__(exc_type, exc_value, tb)
     sys.excepthook = hook
 
-    # PEP 657 — unraisable exceptions (errors during GC, signal slots, etc.)
     def unraisable(args):  # noqa: ANN001 — sys.unraisablehook signature
         msg = "".join(
             traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback)
         )
-        _write_crash(f"unraisable in {args.object!r}", msg)
+        crash_log.error("unraisable in %r:\n%s", args.object, msg)
     sys.unraisablehook = unraisable
 
 
 def _install_qt_message_handler() -> None:
-    """Capture Qt's own warnings (which include "Internal C++ object deleted")."""
+    """Capture Qt's own warnings — including 'Internal C++ object deleted'."""
+    qt_log = logging.getLogger("carpeteater.qt")
+
     def handler(msg_type, _ctx, message) -> None:
-        if msg_type in (QtMsgType.QtWarningMsg, QtMsgType.QtCriticalMsg,
-                        QtMsgType.QtFatalMsg):
-            _write_crash(f"Qt {msg_type.name}", str(message))
+        text = str(message)
+        if msg_type == QtMsgType.QtFatalMsg:
+            qt_log.error("FATAL: %s", text)
+        elif msg_type == QtMsgType.QtCriticalMsg:
+            qt_log.error("CRITICAL: %s", text)
+        elif msg_type == QtMsgType.QtWarningMsg:
+            qt_log.warning("WARNING: %s", text)
     qInstallMessageHandler(handler)
 
 
 def main() -> int:
+    log.setup()
     _install_excepthook()
     _install_qt_message_handler()
+
+    main_log = log.get_logger("carpeteater.main")
+    main_log.info("starting; log file: %s", log.log_path())
 
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(True)
     win = MouthWindow()
     win.show()
-    return app.exec()
+
+    code = app.exec()
+    main_log.info("exec returned with code=%s", code)
+    return code
 
 
 if __name__ == "__main__":

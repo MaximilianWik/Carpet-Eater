@@ -7,15 +7,21 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Diagnostics
+- **`carpeteater/log.py` — unified file logger.** All info/warn/error events are appended to `%LOCALAPPDATA%\CarpetEater\carpet-eater.log` (1 MiB rotating, 3 backups). The same file now holds normal traces and crash dumps, so a single place tells you what happened.
+- Trace logging on every step of the chew pipeline: drop accepted -> worker.run start -> decode done -> DSP start -> DSP done (with chain name) -> write done -> finished signal emitted -> `on_worker_finished` -> finalize -> `finish_chew` -> state SPITTING -> jitter start -> jitter complete -> state IDLE. After a crash, the last line in the log identifies which step failed.
+- `__main__.py` now sets up logging *before* the excepthook + Qt message handler, so unhandled Python exceptions, unraisable errors, and Qt warnings/criticals/fatals all flow to the same file.
+
 ### Fixed
+- **Defensive guards on the post-chew code path.** `paintEvent`, `_finish_chew`, `_on_state_changed`, `_start_jitter`, and `_tick_jitter` now wrap their body in try/except so a single Python-level exception in the post-finish sequence cannot take the process down silently. The exception is logged (and visible in the log file) instead of disappearing into Qt's event dispatch.
+- `paintEvent` also null-checks both the source `QPixmap` and the scaled result before drawing, and uses `try/finally` around the `QPainter` lifetime so it always calls `end()`.
+
+### Fixed (already shipped)
 - **Crash on finishing a chew.** The QThread cleanup chain queued `worker.deleteLater()` on a worker thread whose event loop had already stopped (`thread.finished -> worker.deleteLater`). The deletion event was never processed, leaving a dangling QObject that occasionally faulted on later signal dispatch. Switched to the Qt-recommended pattern: `worker.finished` / `worker.failed` -> `worker.deleteLater` (runs while the loop is still pumping events), `thread.finished` -> `thread.deleteLater` (reaps the thread after it stops).
 - `start_processor()` now wires the window's `on_finished` / `on_failed` slots *before* calling `thread.start()`, removing the race window where a fast worker could emit before the caller had connected.
 - `closeEvent` defends against the QThread C++ object having already been reaped via `deleteLater` while the Python wrapper is still live (would otherwise raise `RuntimeError: Internal C++ object already deleted`).
 
 ### Added
-- **Crash log.** A global `sys.excepthook`, `sys.unraisablehook`, and Qt message handler are installed in `__main__.py`. Any unhandled Python exception, unraisable error, or Qt warning/critical/fatal is appended to `%LOCALAPPDATA%\CarpetEater\crash.log` with a timestamp, so future crashes leave evidence even when the app is launched via `pythonw.exe` or the bundled EXE (no console).
-
-### Performance
 - **~17x DSP speedup.** A 3:49 audio file now chews in ~6 s instead of ~106 s.
   - `stage_comb` rewritten as a vectorized geometric expansion (`y[i] = x[i] + fb*y[i-D]` -> sum of `fb^k * shift(x, k*D)` until `fb^k` is below threshold). Killed the Python sample-by-sample loop.
   - `stage_reverse_smear` rewritten using `np.convolve` against a truncated geometric kernel for the one-pole low-pass. Same audible result, no scipy dependency.

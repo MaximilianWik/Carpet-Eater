@@ -20,7 +20,10 @@ import numpy as np
 import soundfile as sf
 from PySide6.QtCore import QObject, QThread, Signal
 
+from . import log
 from .resources import ffmpeg_path
+
+_log = log.get_logger("carpeteater.processor")
 
 SAMPLE_RATE = 44100
 CHANNELS = 2
@@ -118,26 +121,33 @@ class AudioProcessor(QObject):
 
     def run(self) -> None:
         try:
+            _log.info("worker.run start: %s", self.input_path)
             audio = decode_to_numpy(self.input_path)
+            _log.info("decode done: shape=%s", audio.shape)
             # Lazy imports so the GUI doesn't pay the DSP cost at startup.
             from .audio_fx import chew
 
             seed = seed_for_file(self.input_path)
-            # Three independent sub-streams: chain selection (inside chew),
-            # DSP randomness (inside chew), and output naming (here).
             ss = np.random.SeedSequence(seed)
             naming_seed = int(ss.spawn(1)[0].generate_state(1, dtype=np.uint32)[0])
             naming_rng = np.random.default_rng(naming_seed)
 
+            _log.info("DSP start: seed=%s", seed)
             chain_name, chewed = chew(audio, SAMPLE_RATE, seed=seed)
             self.chain_name = chain_name
+            _log.info("DSP done: chain=%s output_shape=%s", chain_name, chewed.shape)
 
             out = output_path_for(self.input_path, naming_rng)
+            _log.info("write start: %s", out)
             write_wav(out, chewed)
+            _log.info("write done: %s", out)
             self.finished.emit(out)
+            _log.info("finished signal emitted")
         except DecodeError as e:
+            _log.warning("DecodeError: %s", e)
             self.failed.emit(str(e))
         except Exception as e:  # noqa: BLE001 — surface any DSP failure
+            _log.exception("worker.run failed")
             self.failed.emit(f"{type(e).__name__}: {e}")
 
 

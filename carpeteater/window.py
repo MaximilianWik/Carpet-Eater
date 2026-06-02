@@ -28,6 +28,9 @@ from PySide6.QtWidgets import QMenu, QWidget
 from .animator import MouthAnimator, MouthState
 from .processor import start_processor
 from .resources import open_in_explorer, sprite_path
+from . import log
+
+_log = log.get_logger("carpeteater.window")
 
 AUDIO_EXTS = {
     ".mp3", ".wav", ".flac", ".ogg", ".oga", ".m4a", ".aac",
@@ -121,50 +124,68 @@ class MouthWindow(QWidget):
         self.update()
 
     def _on_state_changed(self, state: MouthState) -> None:
-        if state is MouthState.SPITTING:
-            self._start_jitter()
+        _log.info("state changed: %s", state.name)
+        try:
+            if state is MouthState.SPITTING:
+                self._start_jitter()
+        except Exception:
+            _log.exception("error in _on_state_changed")
 
     # --------------------------------------------------------------- paint
     def paintEvent(self, _event: QPaintEvent) -> None:
         sprite_name = self._animator.current_sprite()
-        pm = self._pixmap(sprite_name)
-        if pm.isNull():
+        try:
+            pm = self._pixmap(sprite_name)
+        except Exception:
+            return
+        if pm is None or pm.isNull():
             return
         scaled = pm.scaled(
             self.size(),
             Qt.KeepAspectRatio,
             Qt.SmoothTransformation,
         )
+        if scaled.isNull():
+            return
         x = (self.width() - scaled.width()) // 2 + self._jitter.x()
         y = (self.height() - scaled.height()) // 2 + self._jitter.y()
 
         p = QPainter(self)
-        p.setRenderHint(QPainter.SmoothPixmapTransform, True)
-        p.drawPixmap(x, y, scaled)
-
-        if self._error_alpha > 0:
-            color = QColor(255, 40, 40, int(self._error_alpha * 180))
-            p.fillRect(self.rect(), color)
-        p.end()
+        try:
+            p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+            p.drawPixmap(x, y, scaled)
+            if self._error_alpha > 0:
+                color = QColor(255, 40, 40, int(self._error_alpha * 180))
+                p.fillRect(self.rect(), color)
+        finally:
+            p.end()
 
     # -------------------------------------------------------------- jitter
     def _start_jitter(self) -> None:
-        self._jitter_ticks_left = 8
-        self._jitter_timer.start(40)
+        _log.info("starting spit jitter")
+        try:
+            self._jitter_ticks_left = 8
+            self._jitter_timer.start(40)
+        except Exception:
+            _log.exception("error in _start_jitter")
 
     def _tick_jitter(self) -> None:
-        import random
-        self._jitter_ticks_left -= 1
-        if self._jitter_ticks_left <= 0:
-            self._jitter_timer.stop()
-            self._jitter = QPoint(0, 0)
-        else:
-            mag = 6
-            self._jitter = QPoint(
-                random.randint(-mag, mag),
-                random.randint(-mag, mag),
-            )
-        self.update()
+        try:
+            import random
+            self._jitter_ticks_left -= 1
+            if self._jitter_ticks_left <= 0:
+                self._jitter_timer.stop()
+                self._jitter = QPoint(0, 0)
+                _log.info("spit jitter complete")
+            else:
+                mag = 6
+                self._jitter = QPoint(
+                    random.randint(-mag, mag),
+                    random.randint(-mag, mag),
+                )
+            self.update()
+        except Exception:
+            _log.exception("error in _tick_jitter")
 
     # --------------------------------------------------------- error flash
     def flash_error(self) -> None:
@@ -277,6 +298,7 @@ class MouthWindow(QWidget):
             event.ignore()
             return
         event.acceptProposedAction()
+        _log.info("drop accepted: %s", path)
         self._begin_chew(path)
 
     # --------------------------------------------------------------- chew
@@ -301,10 +323,12 @@ class MouthWindow(QWidget):
         self._worker = worker
 
     def _on_worker_finished(self, output: Path) -> None:
+        _log.info("on_worker_finished: %s", output)
         self._pending_result = (True, output)
         self._maybe_finalize()
 
     def _on_worker_failed(self, message: str) -> None:
+        _log.warning("on_worker_failed: %s", message)
         self._pending_result = (False, message)
         self._maybe_finalize()
 
@@ -313,20 +337,32 @@ class MouthWindow(QWidget):
         if self._pending_result is None:
             return
         if self._min_chew_timer.isActive():
+            _log.debug("finalize deferred — min-chew timer still active")
             return
         ok, payload = self._pending_result
         self._pending_result = None
         self._worker_thread = None
         self._worker = None
+        _log.info("finalize: ok=%s", ok)
         if ok:
             self._finish_chew(payload)  # type: ignore[arg-type]
         else:
             self._fail_chew(str(payload))
 
     def _finish_chew(self, output: Path) -> None:
-        self._last_output = output
-        self.setToolTip(f"Spat: {output.name}")
-        self._animator.set_state(MouthState.SPITTING)
+        _log.info("finish_chew: output=%s", output)
+        try:
+            self._last_output = output
+        except Exception:
+            _log.exception("setting last_output failed")
+        try:
+            self.setToolTip(f"Spat: {output.name}")
+        except Exception:
+            _log.exception("setToolTip failed")
+        try:
+            self._animator.set_state(MouthState.SPITTING)
+        except Exception:
+            _log.exception("set_state(SPITTING) failed")
 
     def _fail_chew(self, message: str) -> None:
         self.setToolTip(f"Choked: {message}")
