@@ -153,6 +153,9 @@ jobs:
           retention-days: 30
 
       # ----------------------------------------------------- rolling main release
+      # Only the unversioned filenames are published to the rolling release —
+      # those are the ones users link to, and they get overwritten each push.
+      # Versioned filenames would accumulate forever.
       - name: Publish rolling main prerelease
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
@@ -171,10 +174,10 @@ jobs:
           files: |
             release/CarpetEater-Setup.exe
             release/CarpetEater-Portable.zip
-            release/CarpetEater-Setup-${{ steps.version.outputs.public }}.exe
-            release/CarpetEater-Portable-${{ steps.version.outputs.public }}.zip
 
       # -------------------------------------------------- numbered tagged release
+      # Tagged releases get both unversioned (for /releases/latest/download/) and
+      # versioned filenames (for permanent links to specific versions).
       - name: Publish tagged release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
