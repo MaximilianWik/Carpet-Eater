@@ -113,9 +113,11 @@ class AudioProcessor(QObject):
     finished = Signal(object)  # Path
     failed = Signal(str)
 
-    def __init__(self, input_path: Path, parent: QObject | None = None) -> None:
+    def __init__(self, input_path: Path, parent: QObject | None = None,
+                 forced_chain: str | None = None) -> None:
         super().__init__(parent)
         self.input_path = input_path
+        self.forced_chain = forced_chain
         self.chain_name: str | None = None  # set after run() succeeds
 
     def run(self) -> None:
@@ -131,8 +133,8 @@ class AudioProcessor(QObject):
             naming_seed = int(ss.spawn(1)[0].generate_state(1, dtype=np.uint32)[0])
             naming_rng = np.random.default_rng(naming_seed)
 
-            _log.info("DSP start: seed=%s", seed)
-            chain_name, chewed = chew(audio, SAMPLE_RATE, seed=seed)
+            _log.info("DSP start: seed=%s forced_chain=%s", seed, self.forced_chain)
+            chain_name, chewed = chew(audio, SAMPLE_RATE, seed=seed, chain=self.forced_chain)
             self.chain_name = chain_name
             _log.info("DSP done: chain=%s output_shape=%s", chain_name, chewed.shape)
 
@@ -151,7 +153,8 @@ class AudioProcessor(QObject):
 
 
 def start_processor(input_path: Path, parent: QObject,
-                    on_finished, on_failed) -> tuple[QThread, AudioProcessor]:
+                    on_finished, on_failed,
+                    forced_chain: str | None = None) -> tuple[QThread, AudioProcessor]:
     """Construct a worker + thread, wire signals, start it.
 
     All connections — including the caller's ``on_finished`` / ``on_failed``
@@ -168,7 +171,7 @@ def start_processor(input_path: Path, parent: QObject,
     dangling QObject that occasionally crashed on later signal dispatch.
     """
     thread = QThread(parent)
-    worker = AudioProcessor(input_path)
+    worker = AudioProcessor(input_path, forced_chain=forced_chain)
     worker.moveToThread(thread)
 
     # User callbacks first.

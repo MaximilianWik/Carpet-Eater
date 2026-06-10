@@ -62,6 +62,8 @@ Run the GUI:
 python run.py
 ```
 
+On first run this also creates a **desktop shortcut** (`Carpet Eater.lnk`) that uses `pythonw.exe` — so double-clicking it later opens the mouth with no CMD window.
+
 Build the EXE + installer + portable ZIP:
 
 ```powershell

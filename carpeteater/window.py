@@ -27,6 +27,7 @@ from PySide6.QtWidgets import QMenu, QWidget
 
 from . import log
 from .animator import MouthAnimator, MouthState
+from .audio_fx import CHAINS
 from .processor import start_processor
 from .resources import open_in_explorer, sprite_path
 
@@ -79,6 +80,9 @@ class MouthWindow(QWidget):
 
         # Last output path (for double-click reveal).
         self._last_output: Path | None = None
+
+        # Forced DSP chain (None = random per seed).
+        self._forced_chain: str | None = None
 
         # Active worker bookkeeping.
         self._worker_thread = None
@@ -297,11 +301,33 @@ class MouthWindow(QWidget):
         menu.addAction(a_open)
 
         menu.addSeparator()
+
+        # Chain submenu
+        chain_menu = QMenu("Chain", self)
+        a_random = QAction("Random (default)", self)
+        a_random.setCheckable(True)
+        a_random.setChecked(self._forced_chain is None)
+        a_random.triggered.connect(lambda: self._set_forced_chain(None))
+        chain_menu.addAction(a_random)
+        chain_menu.addSeparator()
+        for name in sorted(CHAINS.keys()):
+            a = QAction(name, self)
+            a.setCheckable(True)
+            a.setChecked(self._forced_chain == name)
+            a.triggered.connect(lambda checked, n=name: self._set_forced_chain(n))
+            chain_menu.addAction(a)
+        menu.addMenu(chain_menu)
+
+        menu.addSeparator()
         a_quit = QAction("Quit", self)
         a_quit.triggered.connect(self.close)
         menu.addAction(a_quit)
 
         menu.exec(global_pos)
+
+    def _set_forced_chain(self, name: str | None) -> None:
+        self._forced_chain = name
+        _log.info("forced chain set to: %s", name or "random")
 
     def _toggle_always_on_top(self, on: bool) -> None:
         _log.info("toggle always-on-top: %s (state=%s)",
@@ -372,12 +398,14 @@ class MouthWindow(QWidget):
         self._chew_started_at = time.monotonic()
         self._pending_result = None
         self._min_chew_timer.start(self._MIN_CHEW_MS)
-        self.setToolTip(f"Chewing: {path.name}")
+        chain_label = f" [{self._forced_chain}]" if self._forced_chain else ""
+        self.setToolTip(f"Chewing: {path.name}{chain_label}")
 
         thread, worker = start_processor(
             path, self,
             on_finished=self._on_worker_finished,
             on_failed=self._on_worker_failed,
+            forced_chain=self._forced_chain,
         )
         self._worker_thread = thread
         self._worker = worker

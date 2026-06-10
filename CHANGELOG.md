@@ -8,7 +8,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Build system overhaul
-- **`run.py`** — one-command source runner. `python run.py` checks Python version, creates `.venv\`, installs the project, downloads `vendor\ffmpeg.exe` on first run, then launches the GUI. Zero manual setup. Replaces the old `python -m venv` / `pip install -r requirements.txt` / "go fetch ffmpeg from gyan.dev" sequence.
+- **`run.py`** — one-command source runner. `python run.py` checks Python version, creates `.venv\`, installs the project, downloads `vendor\ffmpeg.exe` on first run, creates a desktop shortcut (`Carpet Eater.lnk` via `pythonw.exe` — no CMD window), then launches the GUI. Zero manual setup. Replaces the old `python -m venv` / `pip install -r requirements.txt` / "go fetch ffmpeg from gyan.dev" sequence.
 - **`build.py`** — one-command build pipeline. `python build.py` produces `dist\CarpetEater.exe`, `installer\Output\CarpetEater-Setup.exe`, and `release\CarpetEater-Portable.zip` in a single step. Auto-bootstraps venv, auto-downloads ffmpeg, generates `build_icon.ico` inline, runs PyInstaller, runs Inno Setup if available (skips with a friendly note otherwise), zips the portable. Replaces `build.bat` + `make_icon.py` + manual `iscc` invocation.
 - **Deleted `requirements.txt`** — single source of truth for deps now lives in `pyproject.toml`.
 - **Deleted `build.bat`** — replaced by `build.py` (cross-platform-friendly, idempotent, no shell quirks).
