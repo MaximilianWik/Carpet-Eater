@@ -9,7 +9,8 @@ Does, in order:
   3. Installs the project (and deps) into the venv.
   4. On Windows, downloads vendor\\ffmpeg.exe if missing.
   5. Adds the venv's site-packages to sys.path in-process.
-  6. Imports and launches the GUI.
+  6. Creates a desktop shortcut (once) that uses pythonw.exe — no CMD window.
+  7. Imports and launches the GUI.
 
 Re-running is fast: every step is idempotent and skipped if already done.
 """
@@ -28,6 +29,7 @@ ROOT = Path(__file__).resolve().parent
 VENV = ROOT / ".venv"
 VENV_PY = VENV / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 STAMP = VENV / ".carpeteater-installed"
+SHORTCUT_STAMP = VENV / ".carpeteater-shortcut"
 
 FFMPEG_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 FFMPEG_EXE = ROOT / "vendor" / "ffmpeg.exe"
@@ -109,12 +111,55 @@ def activate_venv() -> None:
         site.addsitedir(str(site_pkgs))
 
 
+def create_shortcut() -> None:
+    """Create a desktop shortcut that launches via pythonw.exe (no CMD window).
+
+    Runs once — skipped on subsequent runs via a stamp file.
+    Skipped silently if the shortcut already exists or PowerShell fails.
+    """
+    if os.name != "nt":
+        return
+    if SHORTCUT_STAMP.exists():
+        return
+    pythonw = VENV / "Scripts" / "pythonw.exe"
+    if not pythonw.exists():
+        return
+    desktop = Path(os.environ.get("USERPROFILE", str(Path.home()))) / "Desktop"
+    if not desktop.exists():
+        return
+    lnk = desktop / "Carpet Eater.lnk"
+    run_py = ROOT / "run.py"
+    icon = ROOT / "build_icon.ico"
+    icon_line = f"$s.IconLocation = '{icon},0'" if icon.exists() else ""
+    ps = "\n".join(filter(None, [
+        "$ws = New-Object -ComObject WScript.Shell",
+        f"$s = $ws.CreateShortcut('{lnk}')",
+        f"$s.TargetPath = '{pythonw}'",
+        f"$s.Arguments = '\"{run_py}\"'",
+        f"$s.WorkingDirectory = '{ROOT}'",
+        "$s.Description = 'Carpet Eater'",
+        icon_line,
+        "$s.Save()",
+    ]))
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+        capture_output=True,
+    )
+    if result.returncode == 0:
+        print(f"Created desktop shortcut: {lnk}")
+        SHORTCUT_STAMP.write_text("ok")
+    else:
+        err = result.stderr.decode(errors="replace").strip()
+        print(f"note: could not create shortcut ({err})", file=sys.stderr)
+
+
 def main() -> int:
     check_python()
     ensure_venv()
     ensure_deps()
     ensure_ffmpeg()
     activate_venv()
+    create_shortcut()
 
     from carpeteater.__main__ import main as app_main  # noqa: PLC0415
     return app_main() or 0
