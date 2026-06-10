@@ -8,7 +8,9 @@ Does, in order:
   2. Creates .venv\\ if missing.
   3. Installs the project (and deps) into the venv.
   4. On Windows, downloads vendor\\ffmpeg.exe if missing.
-  5. Re-execs itself with the venv interpreter and launches the GUI.
+  5. Adds the venv's site-packages to sys.path in-process (no subprocess
+     re-exec, so no extra CMD window appears).
+  6. Imports and launches the GUI.
 
 Re-running is fast: every step is idempotent and skipped if already done.
 """
@@ -16,6 +18,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import site
 import subprocess
 import sys
 import zipfile
@@ -89,15 +92,31 @@ def ensure_ffmpeg() -> None:
             shutil.rmtree(extract_dir, ignore_errors=True)
 
 
+def activate_venv() -> None:
+    """Add the venv's site-packages to sys.path so we can import deps.
+
+    Uses site.addsitedir() which also processes .pth files — needed for
+    editable installs (``pip install -e .`` writes a .pth pointing at the
+    source tree).
+    """
+    if os.name == "nt":
+        site_pkgs = VENV / "Lib" / "site-packages"
+    else:
+        py_ver = f"python{sys.version_info.major}.{sys.version_info.minor}"
+        site_pkgs = VENV / "lib" / py_ver / "site-packages"
+    if not site_pkgs.exists():
+        die(f"venv site-packages not found at {site_pkgs}. Try deleting .venv\\ and re-running.")
+    # Insert before system packages so the venv's versions take precedence.
+    if str(site_pkgs) not in sys.path:
+        site.addsitedir(str(site_pkgs))
+
+
 def main() -> int:
     check_python()
     ensure_venv()
     ensure_deps()
     ensure_ffmpeg()
-
-    # If we're not already running inside the venv, hand off to it.
-    if Path(sys.executable).resolve() != VENV_PY.resolve():
-        return subprocess.call([str(VENV_PY), __file__, *sys.argv[1:]])
+    activate_venv()
 
     from carpeteater.__main__ import main as app_main  # noqa: PLC0415
     return app_main() or 0
