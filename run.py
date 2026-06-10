@@ -8,9 +8,10 @@ Does, in order:
   2. Creates .venv\\ if missing.
   3. Installs the project (and deps) into the venv.
   4. On Windows, downloads vendor\\ffmpeg.exe if missing.
-  5. Adds the venv's site-packages to sys.path in-process (no subprocess
-     re-exec, so no extra CMD window appears).
-  6. Imports and launches the GUI.
+  5. Relaunches via pythonw.exe (once setup is done) so the GUI has no
+     console window — the CMD window disappears at this point.
+  6. Adds the venv's site-packages to sys.path in-process.
+  7. Imports and launches the GUI.
 
 Re-running is fast: every step is idempotent and skipped if already done.
 """
@@ -92,7 +93,30 @@ def ensure_ffmpeg() -> None:
             shutil.rmtree(extract_dir, ignore_errors=True)
 
 
-def activate_venv() -> None:
+def relaunch_windowless() -> None:
+    """Re-exec with the venv's pythonw.exe so the GUI launches with no console window.
+
+    python.exe is a console app — any window that launched it stays open.
+    pythonw.exe is identical but never opens or holds a console.
+
+    We use the *venv's* pythonw.exe (not the system one) so all packages
+    are already on its path — no activate_venv() needed in the child.
+
+    Guard: if we're already running as pythonw.exe this is a no-op,
+    preventing an infinite re-exec loop.
+    """
+    if os.name != "nt":
+        return
+    if Path(sys.executable).name.lower() == "pythonw.exe":
+        return  # already windowless — launch the GUI directly
+    pythonw = VENV / "Scripts" / "pythonw.exe"
+    if not pythonw.exists():
+        return  # no pythonw in venv; fall through and show the window
+    subprocess.Popen([str(pythonw), __file__, *sys.argv[1:]])
+    sys.exit(0)
+
+
+
     """Add the venv's site-packages to sys.path so we can import deps.
 
     Uses site.addsitedir() which also processes .pth files — needed for
@@ -116,6 +140,7 @@ def main() -> int:
     ensure_venv()
     ensure_deps()
     ensure_ffmpeg()
+    relaunch_windowless()  # hand off to pythonw.exe; no-op if already windowless
     activate_venv()
 
     from carpeteater.__main__ import main as app_main  # noqa: PLC0415
