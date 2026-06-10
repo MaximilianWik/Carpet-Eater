@@ -124,33 +124,33 @@ def create_shortcut() -> None:
     pythonw = VENV / "Scripts" / "pythonw.exe"
     if not pythonw.exists():
         return
-    desktop = Path(os.environ.get("USERPROFILE", str(Path.home()))) / "Desktop"
-    if not desktop.exists():
-        return
-    lnk = desktop / "Carpet Eater.lnk"
     run_py = ROOT / "run.py"
     icon = ROOT / "build_icon.ico"
     icon_line = f"$s.IconLocation = '{icon},0'" if icon.exists() else ""
+    # Use PowerShell to resolve Desktop — handles OneDrive/folder-redirect setups
+    # where %USERPROFILE%\Desktop doesn't exist but the real Desktop does.
     ps = "\n".join(filter(None, [
+        "$desktop = [System.Environment]::GetFolderPath('Desktop')",
+        "$lnk = Join-Path $desktop 'Carpet Eater.lnk'",
         "$ws = New-Object -ComObject WScript.Shell",
-        f"$s = $ws.CreateShortcut('{lnk}')",
+        "$s = $ws.CreateShortcut($lnk)",
         f"$s.TargetPath = '{pythonw}'",
         f"$s.Arguments = '\"{run_py}\"'",
         f"$s.WorkingDirectory = '{ROOT}'",
         "$s.Description = 'Carpet Eater'",
         icon_line,
         "$s.Save()",
+        "Write-Output $lnk",
     ]))
     result = subprocess.run(
         ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-        capture_output=True,
+        capture_output=True, text=True,
     )
     if result.returncode == 0:
-        print(f"Created desktop shortcut: {lnk}")
+        print(f"Created desktop shortcut: {result.stdout.strip()}")
         SHORTCUT_STAMP.write_text("ok")
     else:
-        err = result.stderr.decode(errors="replace").strip()
-        print(f"note: could not create shortcut ({err})", file=sys.stderr)
+        print(f"note: could not create shortcut ({result.stderr.strip()})", file=sys.stderr)
 
 
 def main() -> int:
