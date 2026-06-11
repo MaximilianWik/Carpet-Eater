@@ -482,10 +482,27 @@ def chain_looper(x: np.ndarray, sr: int,
                 np.concatenate([np.zeros(smear_ms, dtype=np.float32),
                                 rr[:-smear_ms, 1]])], axis=1)
         pos = s
+        xfade = min(int(sr * 0.050), rr.shape[0] // 8)   # 50 ms crossfade
+        advance = rr.shape[0] - xfade                      # hop size (OLA)
+        fi_env = np.linspace(0.0, 1.0, xfade, dtype=np.float32)[:, None]
+        fo_env = np.linspace(1.0, 0.0, xfade, dtype=np.float32)[:, None]
+        tile_idx = 0
         while pos < n:
-            ep = min(pos + rr.shape[0], n)
-            loop_layer[pos:ep] += 0.5 * rr[:ep - pos]
-            pos += rr.shape[0]
+            ep   = min(pos + rr.shape[0], n)
+            tile = rr[:ep - pos].copy()
+            tlen = ep - pos
+            # Fade-in at every tile boundary except the very first of this bar
+            fi = min(xfade, tlen // 2)
+            if tile_idx > 0 and fi > 1:
+                tile[:fi] *= fi_env[:fi]
+            # Fade-out before the next tile starts (not the last tile — that
+            # is handled by the global cosine fade-out applied afterwards)
+            fo = min(xfade, tlen // 2)
+            if ep < n and fo > 1:
+                tile[-fo:] *= fo_env[:fo]
+            loop_layer[pos:ep] += 0.5 * tile
+            pos += advance
+            tile_idx += 1
 
     # Smooth fade-out on the loop layer over the last loop-length so the
     # final tiled repetition decays to silence instead of cutting off hard.
