@@ -331,8 +331,8 @@ def chain_comb_riser(x: np.ndarray, sr: int,
     Mixed 35 % wet so the source always stays clearly audible.
     """
     n, n_ch = x.shape
-    fb_lo   = 0.30
-    fb_hi   = 0.85
+    fb_lo   = 0.40
+    fb_hi   = 0.95
     D_start = max(1, int(round(sr / 100.0)))    # 441 samples — 100 Hz
     D_end   = max(1, int(round(sr / 1210.0)))   #  36 samples — 1210 Hz
     n_ch_   = n_ch
@@ -362,7 +362,7 @@ def chain_comb_riser(x: np.ndarray, sr: int,
         ci += 1
         i   = e
 
-    mixed = 0.65 * x + 0.35 * out
+    mixed = 0.20 * x + 0.80 * out
     return _normalize(mixed, 0.95)
 
 def chain_arpegiator(x: np.ndarray, sr: int,
