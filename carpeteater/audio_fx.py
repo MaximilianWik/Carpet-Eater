@@ -465,9 +465,7 @@ def chain_looper(x: np.ndarray, sr: int,
     reverb_board = Pedalboard([Reverb(room_size=0.65, damping=0.5,
                                       wet_level=0.35, dry_level=0.65)])
     loop_layer = np.zeros_like(main)   # loop accumulation separate from main
-    # Cap loop length at 3 s — long loops end in near-silence after the
-    # reverb decays, causing audible volume cuts at every tile boundary.
-    chunk_n  = min(max(64, n // 4), int(sr * 3.0))
+    chunk_n  = max(64, n // 4)
     smear_ms = int(sr * 0.005)
 
     for i in range(4):
@@ -479,33 +477,28 @@ def chain_looper(x: np.ndarray, sr: int,
                            sample_rate=sr).T
         rr = np.ascontiguousarray(wet[::-1]).astype(np.float32)
 
-        # Trim to active portion — don't tile silence at the end
-        probe  = sr // 4
-        blocks = [float(np.sqrt(np.mean(rr[k:k+probe].astype(np.float64)**2)))
-                  for k in range(0, rr.shape[0], probe)]
-        peak_b = max(blocks) if blocks else 1.0
-        active = rr.shape[0]
-        for k in range(len(blocks) - 1, -1, -1):
-            if blocks[k] > 0.25 * peak_b:
-                active = min((k + 2) * probe, rr.shape[0])
-                break
-        rr = rr[:active]
+        # Make rr circular: crossfade the last 1 s back into the first 1 s.
+        # This eliminates the quiet tail → loud head jump at every tile seam
+        # without shortening the loop (which made it sound choppy).
+        xfade    = min(int(sr * 1.0), rr.shape[0] // 4)
+        fade_out = np.linspace(1.0, 0.0, xfade, dtype=np.float32)[:, None]
+        fade_in  = np.linspace(0.0, 1.0, xfade, dtype=np.float32)[:, None]
+        rr[-xfade:] = rr[-xfade:] * fade_out + rr[:xfade] * fade_in
 
-        # 50 ms fade-out so the trimmed end decays cleanly
-        fo_n = min(int(sr * 0.050), rr.shape[0] // 4)
-        rr[-fo_n:] *= np.linspace(1.0, 0.0, fo_n, dtype=np.float32)[:, None]
-
-        # Tile with 20 ms fade-in on every restart
-        fi_n   = min(int(sr * 0.020), rr.shape[0] // 8)
+        # Tile seamlessly — no per-tile fade needed since rr is circular.
+        # Only the very first tile of each new bar fades in (bar entry).
+        fi_n   = min(int(sr * 0.100), rr.shape[0] // 8)   # 100 ms bar intro
         fi_env = np.linspace(0.0, 1.0, fi_n, dtype=np.float32)[:, None]
         pos = s
+        ti  = 0
         while pos < n:
             ep   = min(pos + rr.shape[0], n)
             tile = rr[:ep - pos].copy()
-            if fi_n > 1 and len(tile) > fi_n:
+            if ti == 0 and fi_n > 1 and len(tile) > fi_n:
                 tile[:fi_n] *= fi_env
             loop_layer[pos:ep] += 0.5 * tile
             pos += rr.shape[0]
+            ti  += 1
 
     # Smooth fade-out on the loop layer over the last loop-length so the
     # final tiled repetition decays to silence instead of cutting off hard.
