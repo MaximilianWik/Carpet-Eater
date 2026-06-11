@@ -317,82 +317,108 @@ def chain_stomach_acid(x: np.ndarray, sr: int,
 
 
 
+
 def chain_comb_riser(x: np.ndarray, sr: int,
                      rng: np.random.Generator) -> np.ndarray:
-    """ShaperBox FilterShaper (Comb) with 1/32 LFO at 120 BPM.
+    """Single smooth comb sweep from ~200 Hz to 1210 Hz over the file.
 
-    Rising-sawtooth LFO at 16 Hz sweeps the comb resonant frequency
-    from the source fundamental (~196 Hz) up to 1210 Hz each cycle,
-    with fb = 0.935 (~100% resonance).  Per-sample circular-buffer loop
-    handles the time-varying delay length cleanly.
+    One monotonic rise, no LFO oscillation — the resonant frequency
+    climbs once across the full duration.  Mixed 40% wet so it enhances
+    without overriding the source.  fb=0.92 throughout.
     """
+    from scipy.signal import lfilter  # noqa: PLC0415
     n, n_ch = x.shape
-    fb      = 0.935
-    lfo_hz  = 16.0          # 1/32 note @ 120 BPM
-    freq_lo = 196.0         # bottom of sweep (source fundamental G3)
-    freq_hi = 1210.0        # top  of sweep (spec "1.21 kHz cutoff")
-    log_lo  = np.log(freq_lo)
-    log_hi  = np.log(freq_hi)
+    fb       = 0.92
+    freq_lo  = 200.0   # start resonance (near source fundamental)
+    freq_hi  = 1210.0  # end  resonance (spec target)
+    n_chunks = 64      # number of steps in the sweep
+    chunk_n  = max(1, (n + n_chunks - 1) // n_chunks)
 
-    D_max = int(np.ceil(sr / freq_lo)) + 2  # 228 samples
-    buf   = np.zeros((D_max, n_ch), dtype=np.float64)
-    pos   = 0
-    out   = np.zeros((n, n_ch), dtype=np.float32)
+    a_base = np.zeros(1, dtype=np.float64)  # placeholder; rebuilt per chunk
 
-    for i in range(n):
-        # Rising-sawtooth LFO phase → log-sweep of comb frequency
-        phase = (i / sr * lfo_hz) % 1.0
-        fc = np.exp(log_lo + phase * (log_hi - log_lo))
-        D  = max(1, min(D_max - 1, int(round(sr / fc))))
-        read = (pos - D) % D_max
-        delayed = buf[read]
-        y = x[i].astype(np.float64) + fb * delayed
-        buf[pos] = y
-        pos = (pos + 1) % D_max
-        out[i] = y.astype(np.float32)
+    out   = np.zeros_like(x, dtype=np.float32)
+    prev  = np.zeros((0, n_ch), dtype=np.float64)   # running output buffer
 
-    return _normalize(out, 0.95)
+    i = 0
+    for ci in range(n_chunks):
+        e   = min(i + chunk_n, n)
+        seg = x[i:e].astype(np.float64)
+
+        prog = ci / max(1, n_chunks - 1)
+        fc   = freq_lo + (freq_hi - freq_lo) * prog          # linear sweep
+        D    = max(1, int(round(sr / fc)))
+
+        b = np.zeros(D + 1, dtype=np.float64); b[0] = 1.0
+        a = np.zeros(D + 1, dtype=np.float64); a[0] = 1.0; a[D] = -fb
+
+        # Build zi from last D samples of previous output (state continuity)
+        if prev.shape[0] >= D:
+            zi_src = prev[-D:]
+        else:
+            zi_src = np.vstack([np.zeros((D - prev.shape[0], n_ch),
+                                         dtype=np.float64), prev])
+
+        y = np.zeros_like(seg)
+        for ch in range(n_ch):
+            y[:, ch], _ = lfilter(b, a, seg[:, ch], zi=zi_src[:, ch])
+
+        out[i:e] = y.astype(np.float32)
+
+        # Update rolling buffer
+        prev = np.vstack([prev, y])[-max(D, 1):]
+        i = e
+
+    # Mix 40% wet — preserves the source, adds the rising metallic resonance
+    mixed = 0.60 * x + 0.40 * out
+    return _normalize(mixed, 0.95)
 
 
 def chain_arpegiator(x: np.ndarray, sr: int,
                      rng: np.random.Generator) -> np.ndarray:
-    """ShaperBox PitchShaper: natural-minor arpeggio with stereo detune.
+    """Natural-minor arpeggio via Hann-windowed gating of pre-shifted copies.
 
-    L channel pitched at (semi + 0.12 st), R at (semi - 0.12 st) to
-    replicate the ~±0.12-semitone L/R detune measured in the reference
-    (gives stereo_width ≈ 0.8).  Pattern [12,3,3,7,7,3,12,7] at
-    0.25 s/step (8th note @ 120 BPM), pedalboard PitchShift (PSOLA).
+    Instead of hard segment cuts (which sound choppy and expose BPM
+    assumptions), each scale degree is pitch-shifted across the whole
+    file and then gated on/off with an overlapping Hann window centred
+    at its step position.  Adjacent steps overlap by 50%, giving smooth
+    pitch transitions with no clicks.  Steps are proportional to file
+    length — tempo-agnostic.  Mixed 55% wet to keep the source audible.
     """
     from pedalboard import Pedalboard, PitchShift  # noqa: PLC0415
     n = x.shape[0]
-    pattern  = [12, 3, 3, 7, 7, 3, 12, 7]
-    step_len = max(1, sr // 4)           # 0.25 s per step
-    n_steps  = (n + step_len - 1) // step_len
-    fade     = min(int(sr * 0.005), step_len // 4)
-    detune   = 0.12                      # semitones offset between L and R
-    out      = np.zeros_like(x)
 
-    for i in range(n_steps):
-        semi  = float(pattern[i % len(pattern)])
-        start = i * step_len
-        end   = n if i == n_steps - 1 else start + step_len
-        chunk = x[start:end].astype(np.float32)
-        if chunk.shape[0] < 32:
-            continue
-        # Process L and R with ±detune for stereo width
-        out_chunk = np.zeros_like(chunk)
-        for ch, offset in enumerate([+detune, -detune]):
-            mono = chunk[:, ch:ch+1].T          # (1, samples)
-            board = Pedalboard([PitchShift(semitones=semi + offset)])
-            shifted = board(mono, sample_rate=sr).T  # (samples, 1)
-            if fade > 1:
-                ramp = np.linspace(0.0, 1.0, fade, dtype=np.float32)
-                shifted[:fade, 0]  *= ramp
-                shifted[-fade:, 0] *= ramp[::-1]
-            out_chunk[:, ch] = shifted[:end - start, 0]
-        out[start:end] = out_chunk
+    # Natural-minor i7 arpeggio: root, b3, 5, b7, octave, back down
+    pattern  = [0, 3, 7, 10, 12, 10, 7, 3]
+    n_steps  = len(pattern)
+    step_len = n / n_steps          # float — window centre spacing
+    # Window width = 2 × step spacing (50% overlap with neighbours)
+    sigma    = step_len / 2.5       # Gaussian std ≈ half-step
 
-    return _normalize(out, 0.95)
+    out = np.zeros_like(x, dtype=np.float64)
+
+    for idx, semi in enumerate(pattern):
+        board   = Pedalboard([PitchShift(semitones=float(semi))])
+        shifted = board(x.T.astype(np.float32),
+                        sample_rate=sr).T.astype(np.float64)   # (n, ch)
+
+        # Gaussian envelope centred at this step
+        center = (idx + 0.5) * step_len
+        t      = np.arange(n, dtype=np.float64)
+        env    = np.exp(-0.5 * ((t - center) / sigma) ** 2)
+        out   += env[:, None] * shifted
+
+    # Normalise the summed envelope so peak env = 1 (prevents loudness jump)
+    env_sum = np.zeros(n, dtype=np.float64)
+    for idx in range(n_steps):
+        center   = (idx + 0.5) * step_len
+        t        = np.arange(n, dtype=np.float64)
+        env_sum += np.exp(-0.5 * ((t - center) / sigma) ** 2)
+    env_sum = np.maximum(env_sum, 1e-9)
+    out = (out / env_sum[:, None]).astype(np.float32)
+
+    # Mix 55% arpeggio + 45% dry — source remains present
+    mixed = 0.45 * x + 0.55 * out
+    return _normalize(mixed, 0.95)
 
 
 def chain_looper(x: np.ndarray, sr: int,
