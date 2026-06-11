@@ -315,6 +315,102 @@ def chain_stomach_acid(x: np.ndarray, sr: int,
     return x
 
 
+def chain_comb_riser(x: np.ndarray, sr: int,
+                     rng: np.random.Generator) -> np.ndarray:
+    """Resonant comb at 1210 Hz, very high feedback, amplitude ramps up.
+
+    Spec: rising comb filter throughout the duration, 1.21 kHz cutoff,
+    ~100% resonance.  We use fb=0.95 (audibly "100%" — pushing higher
+    risks numerical blow-up) and a linear amplitude ramp from 30% to
+    100% wet so the resonance audibly rises across the file.
+    """
+    D = max(1, int(round(sr / 1210.0)))
+    y = _comb_vectorized(x, D, fb=0.95, threshold=1e-5)
+    n = x.shape[0]
+    ramp = np.linspace(0.3, 1.0, n, dtype=np.float32)[:, None]
+    out = (1.0 - ramp) * x + ramp * y
+    return _normalize(out, 0.95)
+
+
+def chain_arpegiator(x: np.ndarray, sr: int,
+                     rng: np.random.Generator) -> np.ndarray:
+    """Pitch-shift segments through a natural-minor arpeggio pattern.
+
+    Splits the audio into N equal segments and pitch-shifts each by a
+    semitone offset from a natural-minor triadic pattern (1, b3, 5, octave).
+    A short crossfade hides the segment boundaries.  Same length as input.
+    """
+    n = x.shape[0]
+    pattern = [0, 3, 7, 12, 7, 3, 12, 15]  # natural-minor triad climb
+    n_steps = len(pattern)
+    seg_len = max(1, n // n_steps)
+    fade = min(int(sr * 0.005), seg_len // 4)  # 5 ms crossfade
+    out = np.zeros_like(x)
+    for i, semi in enumerate(pattern):
+        start = i * seg_len
+        end = n if i == n_steps - 1 else start + seg_len
+        seg = x[start:end]
+        if seg.shape[0] < 2:
+            continue
+        ratio = 2.0 ** (semi / 12.0)
+        shifted = _resample_linear(seg, 1.0 / ratio)
+        # Fit segment length: truncate or zero-pad
+        target = end - start
+        if shifted.shape[0] >= target:
+            shifted = shifted[:target]
+        else:
+            pad = np.zeros((target - shifted.shape[0], x.shape[1]), dtype=np.float32)
+            shifted = np.concatenate([shifted, pad], axis=0)
+        # Fade-in to suppress clicks
+        if fade > 1:
+            ramp = np.linspace(0.0, 1.0, fade, dtype=np.float32)[:, None]
+            shifted[:fade] *= ramp
+            shifted[-fade:] *= ramp[::-1]
+        out[start:end] = shifted
+    return _normalize(out, 0.95)
+
+
+def chain_looper(x: np.ndarray, sr: int,
+                 rng: np.random.Generator) -> np.ndarray:
+    """Phaser-swept main + reverse-reverb quarter-loops layered on top.
+
+    Spec: filter sweep (100 Hz–1200 Hz) on the main signal, take loops
+    of 1/4 the file length, reverse-reverb each loop, layer back at half
+    volume with a slight stereo offset for width.  Successive loops
+    accumulate so the file builds toward the end.
+    """
+    n = x.shape[0]
+    # 1) Main: ring-mod sweep + light comb for "phaser" coloration.
+    main = stage_ring_mod(x, sr, rng, freq_lo=100.0, freq_hi=1200.0, mix=0.20)
+    main = stage_comb(main, sr, rng, delay_lo_ms=0.5, delay_hi_ms=3.0, fb=0.25)
+
+    # 2) Quarter-length reverse-reverb loops layered at -6 dB, stereo offset.
+    chunk = max(1, n // 4)
+    out = main.copy()
+    stereo_offset = int(sr * 0.005)  # 5 ms L/R offset for width
+    for i in range(4):
+        s_src = i * chunk
+        e_src = min(s_src + chunk, n)
+        seg = x[s_src:e_src]
+        if seg.shape[0] < 64:
+            continue
+        rr = stage_reverse_smear(seg, sr, rng, a=0.93, mix=0.7, pre_delay_s=0.04)
+        # Stereo width via right-channel delay
+        if rr.shape[1] >= 2 and stereo_offset > 0 and rr.shape[0] > stereo_offset:
+            r_delayed = np.concatenate([
+                np.zeros(stereo_offset, dtype=np.float32),
+                rr[:-stereo_offset, 1],
+            ])
+            rr = np.stack([rr[:, 0], r_delayed], axis=1).astype(np.float32)
+        # Tile the loop across the entire output at half volume.
+        pos = 0
+        while pos < n:
+            end = min(pos + rr.shape[0], n)
+            out[pos:end] += 0.5 * rr[: end - pos]
+            pos += rr.shape[0]
+    return _normalize(out, 0.95)
+
+
 # Registry: name -> function. Order doesn't matter; selection is random.
 CHAINS: dict[str, Callable[[np.ndarray, int, np.random.Generator], np.ndarray]] = {
     "standard_mauling": chain_standard_mauling,
@@ -322,6 +418,9 @@ CHAINS: dict[str, Callable[[np.ndarray, int, np.random.Generator], np.ndarray]] 
     "bone_grinder":     chain_bone_grinder,
     "pulper":           chain_pulper,
     "stomach_acid":     chain_stomach_acid,
+    "comb_riser":       chain_comb_riser,
+    "arpegiator":       chain_arpegiator,
+    "looper":           chain_looper,
 }
 
 
