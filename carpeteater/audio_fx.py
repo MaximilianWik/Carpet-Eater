@@ -316,132 +316,151 @@ def chain_stomach_acid(x: np.ndarray, sr: int,
 
 
 
+
 def chain_comb_riser(x: np.ndarray, sr: int,
                      rng: np.random.Generator) -> np.ndarray:
-    """Feedback comb at 1210 Hz, resonance rises from 0 to ~100% over the file.
+    """ShaperBox FilterShaper (Comb) with 1/32 LFO at 120 BPM.
 
-    IIR comb: y[n] = x[n] + fb * y[n-D], D = round(sr/1210) ~= 36 samples.
-    Processed in 32 chunks; fb rises linearly 0.0 -> 0.97.
-    scipy lfilter zi carries delay-buffer state across chunk boundaries.
+    Rising-sawtooth LFO at 16 Hz sweeps the comb resonant frequency
+    from the source fundamental (~196 Hz) up to 1210 Hz each cycle,
+    with fb = 0.935 (~100% resonance).  Per-sample circular-buffer loop
+    handles the time-varying delay length cleanly.
     """
-    from scipy.signal import lfilter  # noqa: PLC0415
     n, n_ch = x.shape
-    D = max(1, int(round(sr / 1210.0)))
-    n_chunks = 32
-    chunk_len = max(D * 4, (n + n_chunks - 1) // n_chunks)
+    fb      = 0.935
+    lfo_hz  = 16.0          # 1/32 note @ 120 BPM
+    freq_lo = 196.0         # bottom of sweep (source fundamental G3)
+    freq_hi = 1210.0        # top  of sweep (spec "1.21 kHz cutoff")
+    log_lo  = np.log(freq_lo)
+    log_hi  = np.log(freq_hi)
 
-    b = np.zeros(D + 1, dtype=np.float64); b[0] = 1.0
-    a_base = np.zeros(D + 1, dtype=np.float64); a_base[0] = 1.0
+    D_max = int(np.ceil(sr / freq_lo)) + 2  # 228 samples
+    buf   = np.zeros((D_max, n_ch), dtype=np.float64)
+    pos   = 0
+    out   = np.zeros((n, n_ch), dtype=np.float32)
 
-    out = np.zeros_like(x, dtype=np.float32)
-    zi = np.zeros((D, n_ch), dtype=np.float64)
-    i, chunk_idx = 0, 0
-    while i < n:
-        e = min(i + chunk_len, n)
-        seg = x[i:e].astype(np.float64)
-        fb = chunk_idx / max(1, n_chunks - 1) * 0.97
-        a = a_base.copy(); a[D] = -fb
-        y, zi = lfilter(b, a, seg, axis=0, zi=zi)
-        out[i:e] = y.astype(np.float32)
-        i = e; chunk_idx += 1
+    for i in range(n):
+        # Rising-sawtooth LFO phase → log-sweep of comb frequency
+        phase = (i / sr * lfo_hz) % 1.0
+        fc = np.exp(log_lo + phase * (log_hi - log_lo))
+        D  = max(1, min(D_max - 1, int(round(sr / fc))))
+        read = (pos - D) % D_max
+        delayed = buf[read]
+        y = x[i].astype(np.float64) + fb * delayed
+        buf[pos] = y
+        pos = (pos + 1) % D_max
+        out[i] = y.astype(np.float32)
+
     return _normalize(out, 0.95)
 
 
 def chain_arpegiator(x: np.ndarray, sr: int,
                      rng: np.random.Generator) -> np.ndarray:
-    """Duration-preserving pitch-shift through a natural-minor arpeggio.
+    """ShaperBox PitchShaper: natural-minor arpeggio with stereo detune.
 
-    Uses pedalboard.PitchShift (PSOLA). Pattern [12,3,3,7,7,3,12,7]
-    at 0.25s/step (8th-note @ 120 BPM) matches the reference:
-      t=0.00->+12 (656 Hz), t=0.25->+3 (232 Hz), t=0.50->+3,
-      t=0.75->+7 (488 Hz), t=1.00->+7, t=1.25->+3, t=1.50->+12.
+    L channel pitched at (semi + 0.12 st), R at (semi - 0.12 st) to
+    replicate the ~±0.12-semitone L/R detune measured in the reference
+    (gives stereo_width ≈ 0.8).  Pattern [12,3,3,7,7,3,12,7] at
+    0.25 s/step (8th note @ 120 BPM), pedalboard PitchShift (PSOLA).
     """
     from pedalboard import Pedalboard, PitchShift  # noqa: PLC0415
     n = x.shape[0]
-    pattern = [12, 3, 3, 7, 7, 3, 12, 7]
-    step_len = max(1, sr // 4)          # 0.25 s = 8th note @ 120 BPM
-    n_steps = (n + step_len - 1) // step_len
-    fade = min(int(sr * 0.005), step_len // 4)
-    out = np.zeros_like(x)
+    pattern  = [12, 3, 3, 7, 7, 3, 12, 7]
+    step_len = max(1, sr // 4)           # 0.25 s per step
+    n_steps  = (n + step_len - 1) // step_len
+    fade     = min(int(sr * 0.005), step_len // 4)
+    detune   = 0.12                      # semitones offset between L and R
+    out      = np.zeros_like(x)
+
     for i in range(n_steps):
-        semi = pattern[i % len(pattern)]
+        semi  = float(pattern[i % len(pattern)])
         start = i * step_len
-        end = n if i == n_steps - 1 else start + step_len
+        end   = n if i == n_steps - 1 else start + step_len
         chunk = x[start:end].astype(np.float32)
         if chunk.shape[0] < 32:
             continue
-        board = Pedalboard([PitchShift(semitones=float(semi))])
-        shifted = board(chunk.T, sample_rate=sr).T.astype(np.float32)
-        if fade > 1:
-            ramp = np.linspace(0.0, 1.0, fade, dtype=np.float32)[:, None]
-            shifted[:fade] *= ramp
-            shifted[-fade:] *= ramp[::-1]
-        out[start:end] = shifted[:end - start]
+        # Process L and R with ±detune for stereo width
+        out_chunk = np.zeros_like(chunk)
+        for ch, offset in enumerate([+detune, -detune]):
+            mono = chunk[:, ch:ch+1].T          # (1, samples)
+            board = Pedalboard([PitchShift(semitones=semi + offset)])
+            shifted = board(mono, sample_rate=sr).T  # (samples, 1)
+            if fade > 1:
+                ramp = np.linspace(0.0, 1.0, fade, dtype=np.float32)
+                shifted[:fade, 0]  *= ramp
+                shifted[-fade:, 0] *= ramp[::-1]
+            out_chunk[:, ch] = shifted[:end - start, 0]
+        out[start:end] = out_chunk
+
     return _normalize(out, 0.95)
 
 
 def chain_looper(x: np.ndarray, sr: int,
                  rng: np.random.Generator) -> np.ndarray:
-    """LPF sweep + phaser on main signal, plus accumulated reverse-reverb loops.
+    """ShaperBox FilterShaper (LP, subtle) + PanShaper + reverse-reverb loops.
 
-    1. LPF cutoff sweeps 100 Hz <-> 1200 Hz at 1 Hz (slow fader).
-       scipy butter sosfilt with state carried across 2048-sample blocks.
-    2. pedalboard Phaser: fb=0.25, mix=0.20 (stereo width).
-    3. Four 1/4-file loops: each is reverse-reverbed (Reverb on reversed
-       chunk, flipped back) and tiled at half volume from its bar start.
+    Reference analysis shows frequency content nearly identical to raw —
+    the filter/phaser effect is subtle.  Main character: four 1/4-file
+    reverse-reverb loops accumulate from bar 1-4, each at half volume.
+    Slight 5 ms L/R delay on loops for stereo width.
     """
     from pedalboard import Pedalboard, Phaser, Reverb  # noqa: PLC0415
     from scipy.signal import butter, sosfilt  # noqa: PLC0415
     n, n_ch = x.shape
 
-    # --- 1. LPF sweep ---
-    block = 2048
+    # Very subtle LP sweep — barely audible but present (10 % wet)
+    block, lp_mix = 2048, 0.10
     main_lpf = np.zeros_like(x, dtype=np.float32)
     zi = None
     for i in range(0, n, block):
         e = min(i + block, n)
         t_mid = (i + (e - i) / 2) / sr
-        lfo = 0.5 + 0.5 * np.sin(2.0 * np.pi * 1.0 * t_mid)
-        fc = np.exp(np.log(100.0) + lfo * (np.log(1200.0) - np.log(100.0)))
-        fc_norm = min(fc / (sr / 2.0), 0.99)
-        sos = butter(2, fc_norm, btype='low', output='sos')
+        lfo   = 0.5 + 0.5 * np.sin(2.0 * np.pi * 0.5 * t_mid)  # 0.5 Hz
+        fc    = np.exp(np.log(100.0) + lfo * (np.log(1200.0) - np.log(100.0)))
+        fc_n  = min(fc / (sr / 2.0), 0.99)
+        sos   = butter(2, fc_n, btype='low', output='sos')
         if zi is None:
             zi = np.zeros((sos.shape[0], 2, n_ch))
-        chunk = x[i:e].astype(np.float32)
+        chunk     = x[i:e].astype(np.float32)
         out_chunk = np.zeros_like(chunk)
         for ch in range(n_ch):
-            out_chunk[:, ch], zi[:, :, ch] = sosfilt(sos, chunk[:, ch], zi=zi[:, :, ch])
+            out_chunk[:, ch], zi[:, :, ch] = sosfilt(
+                sos, chunk[:, ch], zi=zi[:, :, ch])
         main_lpf[i:e] = out_chunk
 
-    # --- 2. Phaser ---
-    phaser_board = Pedalboard([Phaser(
-        rate_hz=1.0, depth=1.0, centre_frequency_hz=650.0,
-        feedback=0.25, mix=0.20,
-    )])
-    main = phaser_board(main_lpf.T.astype(np.float32), sample_rate=sr).T.astype(np.float32)
+    main = (1 - lp_mix) * x + lp_mix * main_lpf
 
-    # --- 3. Reverse-reverb loops ---
+    # Gentle phaser for PanShaper-style stereo movement
+    ph = Pedalboard([Phaser(rate_hz=0.5, depth=0.5, centre_frequency_hz=650.0,
+                            feedback=0.25, mix=0.10)])
+    main = ph(main.T.astype(np.float32), sample_rate=sr).T.astype(np.float32)
+
+    # Reverse-reverb loops (1/4 file each), tiled from bar start, at -6 dB
     reverb_board = Pedalboard([Reverb(room_size=0.85, damping=0.4,
-                                      wet_level=0.8, dry_level=0.2)])
-    out = main.copy()
-    chunk_len = max(64, n // 4)
-    stereo_ms = int(sr * 0.005)
+                                      wet_level=0.8,  dry_level=0.2)])
+    out      = main.copy()
+    chunk_n  = max(64, n // 4)
+    smear_ms = int(sr * 0.005)
+
     for i in range(4):
-        s, e = i * chunk_len, min((i + 1) * chunk_len, n)
-        seg = x[s:e].astype(np.float32)
+        s, e = i * chunk_n, min((i + 1) * chunk_n, n)
+        seg  = x[s:e].astype(np.float32)
         if seg.shape[0] < 64:
             continue
-        wet = reverb_board(np.ascontiguousarray(seg[::-1]).T, sample_rate=sr).T
+        wet = reverb_board(np.ascontiguousarray(seg[::-1]).T,
+                           sample_rate=sr).T
         rr = np.ascontiguousarray(wet[::-1]).astype(np.float32)
-        if rr.shape[1] >= 2 and stereo_ms > 0 and rr.shape[0] > stereo_ms:
-            rr = np.stack([rr[:, 0],
-                           np.concatenate([np.zeros(stereo_ms, dtype=np.float32),
-                                           rr[:-stereo_ms, 1]])], axis=1)
+        if rr.shape[1] >= 2 and smear_ms > 0 and rr.shape[0] > smear_ms:
+            rr = np.stack([
+                rr[:, 0],
+                np.concatenate([np.zeros(smear_ms, dtype=np.float32),
+                                rr[:-smear_ms, 1]])], axis=1)
         pos = s
         while pos < n:
             ep = min(pos + rr.shape[0], n)
             out[pos:ep] += 0.5 * rr[:ep - pos]
             pos += rr.shape[0]
+
     return _normalize(out, 0.95)
 
 
