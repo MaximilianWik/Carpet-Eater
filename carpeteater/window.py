@@ -409,6 +409,9 @@ class MouthWindow(QWidget):
         )
         self._worker_thread = thread
         self._worker = worker
+        # Defer Python-ref cleanup to after the thread's event loop has exited.
+        # See _clear_worker_refs for the explanation.
+        thread.finished.connect(self._clear_worker_refs)
 
     def _on_worker_finished(self, output: Path) -> None:
         _log.info("on_worker_finished: %s", output)
@@ -429,13 +432,34 @@ class MouthWindow(QWidget):
             return
         ok, payload = self._pending_result
         self._pending_result = None
-        self._worker_thread = None
-        self._worker = None
+        # _worker / _worker_thread are intentionally NOT cleared here.
+        # Clearing them here would drop the Python wrapper refcount to zero
+        # while the worker thread's deleteLater DeferredDelete event may still
+        # be in-flight — PySide6 would then try to free the C++ object on the
+        # main thread concurrently with the worker thread doing the same, which
+        # is a silent double-free crash (no Python exception, no log entry).
+        # Instead, _clear_worker_refs() is connected to thread.finished so the
+        # refs are only dropped after the thread's event loop has fully exited
+        # and the DeferredDelete has been processed.
         _log.info("finalize: ok=%s", ok)
         if ok:
             self._finish_chew(payload)  # type: ignore[arg-type]
         else:
             self._fail_chew(str(payload))
+
+    def _clear_worker_refs(self) -> None:
+        """Drop worker/thread Python refs after thread.finished.
+
+        Connected to QThread.finished in _begin_chew so this runs only after
+        the worker thread's event loop has exited and its DeferredDelete event
+        (posted by worker.finished -> worker.deleteLater) has been fully
+        processed.  Clearing self._worker here is then safe: the C++ object is
+        already gone and PySide6 just frees the (already-invalid) Python
+        wrapper with no double-free risk.
+        """
+        _log.debug("clearing worker refs after thread.finished")
+        self._worker_thread = None
+        self._worker = None
 
     def _finish_chew(self, output: Path) -> None:
         _log.info("finish_chew: output=%s", output)
@@ -459,11 +483,18 @@ class MouthWindow(QWidget):
 
     # ---------------------------------------------------------------- close
     def closeEvent(self, event) -> None:
+        # Disconnect _clear_worker_refs so it cannot fire after the window is
+        # gone (thread.finished may be delivered after the widget is destroyed).
+        thread = self._worker_thread
+        if thread is not None:
+            try:
+                thread.finished.disconnect(self._clear_worker_refs)
+            except (RuntimeError, TypeError):
+                pass  # already disconnected or C++ object already deleted
         # Wait briefly for any in-flight worker so we don't drop an output.
         # The QThread C++ object may already be in deleteLater limbo even when
         # our Python ref is still live — guard against the resulting
         # RuntimeError ("Internal C++ object already deleted").
-        thread = self._worker_thread
         self._worker_thread = None
         self._worker = None
         if thread is not None:

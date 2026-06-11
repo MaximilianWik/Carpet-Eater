@@ -8,29 +8,46 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
-- **Root cause of "freeze before spit animation" crash.** Two independent crash vectors,
-  both triggered by `chain_arpegiator` or `chain_looper` being randomly selected (25% of
-  all chews):
+- **Root cause of the "freeze before spit animation" crash.** The log shows every
+  instance of the crash has the same signature: `on_worker_finished` is logged, then the
+  process exits silently — `finalize: ok=True` is never written.  The crash happens in
+  `_maybe_finalize` between `self._worker = None` and the next log call.
 
-  1. **JUCE `abort()` via missing COM initialization.** Both chains import `pedalboard`
-     (which wraps JUCE) inside the Qt worker thread. Windows requires `CoInitializeEx` on
-     every thread before calling into COM-backed audio APIs (WASAPI, DirectSound, JUCE).
-     Qt worker threads do not set this up. JUCE detected the missing apartment and called
-     `abort()`, killing the process silently — before any Python `except` could catch it,
-     and before the SPITTING animation ever fired. Fixed by:
-     - Removing `arpegiator` and `looper` from the random `CHAINS` pool. They are still
-       defined and accessible via `--chain arpegiator / --chain looper` on the CLI.
-     - Adding `CoInitializeEx(COINIT_MULTITHREADED)` at the top of `AudioProcessor.run()`
-       as defense-in-depth for any future pedalboard usage in the worker thread, with a
-       matching `CoUninitialize()` in a `finally` block.
+  **Cause — PySide6 double-free race:**  `worker.deleteLater()` is connected via a
+  *direct* connection to `worker.finished`, so it is called synchronously on the worker
+  thread at the moment the signal is emitted.  This posts a `QEvent::DeferredDelete` to
+  the worker thread's event loop.  The worker thread processes that event and destroys
+  the C++ `AudioProcessor` object.  Simultaneously, the main thread receives the queued
+  `on_worker_finished` signal, runs `_maybe_finalize`, and sets `self._worker = None`.
+  Dropping the last Python reference triggers PySide6's `tp_dealloc`, which checks
+  whether the C++ object is still alive.  If the worker thread's DeferredDelete has not
+  yet been processed, PySide6 finds the C++ object alive and calls `delete` on it —
+  from the main thread — while the worker thread is about to do the same.  Double-free →
+  heap corruption → silent SIGSEGV → the process exits with no exception, no log entry,
+  before the SPITTING animation ever fires.
 
-  2. **OOM crash in `chain_arpegiator` on 4-minute files.** `np.arange(n, dtype=float64)`
-     was called 16 times inside two nested loops. For a 4-minute file (10 M samples) each
-     call allocates 80 MB, totalling ~1.3 GB of throwaway temporaries on top of the working
-     buffers. NumPy's C layer can raise `MemoryError` after partial allocation, before Python
-     can catch it — also producing a silent process exit. Fixed by moving the single
-     `t = np.arange(n, dtype=np.float64)` computation outside both loops (58% peak-memory
-     reduction, ~700 MB → ~290 MB savings).
+  **Fix:**
+  - Removed `self._worker = None` / `self._worker_thread = None` from `_maybe_finalize`.
+  - Added `_clear_worker_refs()` method that sets them to None.
+  - Connected `thread.finished → _clear_worker_refs` in `_begin_chew`.  By the time
+    `thread.finished` fires the worker thread's event loop has exited, guaranteeing the
+    DeferredDelete has been fully processed and the C++ object is already gone.  PySide6
+    then just frees the (already-invalidated) Python wrapper — no double-free.
+  - Updated `closeEvent` to disconnect `_clear_worker_refs` before quitting, so the slot
+    cannot fire on a destroyed window if the thread finishes after window teardown.
+
+- **`chain_arpegiator` / `chain_looper` removed from random chain pool.**  Both import
+  `pedalboard` (JUCE) in the worker thread.  On Windows, JUCE requires `CoInitializeEx`
+  on any thread before COM-backed audio operations; Qt worker threads do not set this up,
+  causing a JUCE assertion → `abort()` → silent process exit.  `chain_arpegiator` also
+  allocates ~1.3 GB of throwaway temporaries for a 4-minute file (`np.arange(n)` called
+  16× inside loops), which can OOM-crash in numpy's C layer before Python's `except` can
+  catch it.  Both chains remain defined and callable via `--chain arpegiator / --chain
+  looper` on the CLI.  `_EXPERIMENTAL_CHAINS` registry added; `chew()`, `--chain`
+  choices, and `--list-chains` updated accordingly.  `np.arange(n)` hoisted outside the
+  loops in `chain_arpegiator` (58 % peak-memory reduction).
+  Added `CoInitializeEx(COINIT_MULTITHREADED)` + matching `CoUninitialize()` in
+  `AudioProcessor.run()` as defense-in-depth for any future pedalboard usage.
 
 ### Build system overhaul
 - **`run.py`** — one-command source runner. `python run.py` checks Python version, creates `.venv\`, installs the project, downloads `vendor\ffmpeg.exe` on first run, creates a desktop shortcut (`Carpet Eater.lnk` via `pythonw.exe` — no CMD window), then launches the GUI. Zero manual setup. Replaces the old `python -m venv` / `pip install -r requirements.txt` / "go fetch ffmpeg from gyan.dev" sequence.
