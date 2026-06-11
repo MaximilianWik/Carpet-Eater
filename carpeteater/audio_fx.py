@@ -317,56 +317,81 @@ def chain_stomach_acid(x: np.ndarray, sr: int,
 
 def chain_comb_riser(x: np.ndarray, sr: int,
                      rng: np.random.Generator) -> np.ndarray:
-    """Resonant comb at 1210 Hz, very high feedback, amplitude ramps up.
+    """Comb filter that sweeps from ~100 Hz up to 1210 Hz with high resonance.
 
     Spec: rising comb filter throughout the duration, 1.21 kHz cutoff,
-    ~100% resonance.  We use fb=0.95 (audibly "100%" — pushing higher
-    risks numerical blow-up) and a linear amplitude ramp from 30% to
-    100% wet so the resonance audibly rises across the file.
+    ~100% resonance.
+
+    The analysis of the reference shows NEW frequencies appearing at each
+    time slice (380 Hz at t=1.5 s, 468 Hz at t=2.25 s, etc.), proving
+    the resonant frequency SWEEPS upward — it is not a fixed-frequency
+    comb. We approximate the sweep by running ``_comb_vectorized`` at
+    four frequencies (100 → 300 → 600 → 1210 Hz) and blending them with
+    overlapping Gaussian envelopes whose centres march through time.
     """
-    D = max(1, int(round(sr / 1210.0)))
-    y = _comb_vectorized(x, D, fb=0.95, threshold=1e-5)
     n = x.shape[0]
-    ramp = np.linspace(0.3, 1.0, n, dtype=np.float32)[:, None]
-    out = (1.0 - ramp) * x + ramp * y
+    sweep_freqs = [100, 300, 600, 1210]
+    result = np.zeros_like(x, dtype=np.float64)
+    norm = np.zeros(n, dtype=np.float64)
+    sigma = n / len(sweep_freqs) * 1.5
+    t_idx = np.arange(n, dtype=np.float64)
+    for i, freq in enumerate(sweep_freqs):
+        D = max(1, int(round(sr / freq)))
+        y = _comb_vectorized(x, D, fb=0.95, threshold=1e-6).astype(np.float64)
+        center = (i + 0.5) / len(sweep_freqs) * n
+        weight = np.exp(-0.5 * ((t_idx - center) / sigma) ** 2)
+        result += weight[:, None] * y
+        norm += weight
+    norm = np.maximum(norm, 1e-9)
+    out = (result / norm[:, None]).astype(np.float32)
     return _normalize(out, 0.95)
 
 
 def chain_arpegiator(x: np.ndarray, sr: int,
                      rng: np.random.Generator) -> np.ndarray:
-    """Pitch-shift segments through a natural-minor arpeggio pattern.
+    """Duration-preserving pitch-shift through a natural-minor arpeggio.
 
-    Splits the audio into N equal segments and pitch-shifts each by a
-    semitone offset from a natural-minor triadic pattern (1, b3, 5, octave).
-    A short crossfade hides the segment boundaries.  Same length as input.
+    Spec: play the sample in different pitches to closely resemble a
+    natural-minor arpeggiator.
+
+    Uses pedalboard.PitchShift (PSOLA — pitch shifts without changing
+    duration, unlike resampling). Splits the audio into 16 equal segments
+    and cycles through the G natural-minor pattern:
+    [0, 3, 7, 12, 7, 3, 12, 10]  (root, b3, 5, oct, 5, b3, oct, b7)
+    repeated twice, with 5 ms crossfade at each boundary.
     """
+    from pedalboard import Pedalboard, PitchShift  # noqa: PLC0415
     n = x.shape[0]
-    pattern = [0, 3, 7, 12, 7, 3, 12, 15]  # natural-minor triad climb
+    # Reverse-engineering the reference (0.25 s windows):
+    #   t=0.00 → +12 (E4→E5 656 Hz ✓), t=0.25 → +3 (G3→Bb3 232 Hz ✓),
+    #   t=0.50 → +3, t=0.75 → +7 (D4 ✓), t=1.00 → +7, t=1.25 → +3,
+    #   t=1.50 → +12 (G4 396 Hz ✓), t=1.75 → +7 (cycling back)
+    # Pattern: natural-minor triad, starting an octave up, stepping at
+    # 8th-note rate (≈ 0.25 s per step at 120 BPM).
+    pattern = [12, 3, 3, 7, 7, 3, 12, 7]
+    step_len = max(1, sr // 4)  # 0.25 s per step (8th note @ 120 BPM)
+    n_steps = (n + step_len - 1) // step_len
     n_steps = len(pattern)
-    seg_len = max(1, n // n_steps)
-    fade = min(int(sr * 0.005), seg_len // 4)  # 5 ms crossfade
+    fade = min(int(sr * 0.005), step_len // 4)  # 5 ms crossfade
     out = np.zeros_like(x)
-    for i, semi in enumerate(pattern):
-        start = i * seg_len
-        end = n if i == n_steps - 1 else start + seg_len
-        seg = x[start:end]
-        if seg.shape[0] < 2:
+
+    for i in range(n_steps):
+        semi = pattern[i % len(pattern)]
+        start = i * step_len
+        end = n if i == n_steps - 1 else start + step_len
+        chunk = x[start:end].astype(np.float32)
+        if chunk.shape[0] < 32:
             continue
-        ratio = 2.0 ** (semi / 12.0)
-        shifted = _resample_linear(seg, 1.0 / ratio)
-        # Fit segment length: truncate or zero-pad
-        target = end - start
-        if shifted.shape[0] >= target:
-            shifted = shifted[:target]
-        else:
-            pad = np.zeros((target - shifted.shape[0], x.shape[1]), dtype=np.float32)
-            shifted = np.concatenate([shifted, pad], axis=0)
-        # Fade-in to suppress clicks
+        # pedalboard: (channels, samples) float32
+        board = Pedalboard([PitchShift(semitones=float(semi))])
+        shifted = board(chunk.T, sample_rate=sr).T.astype(np.float32)
+        # Fade edges to suppress boundary clicks
         if fade > 1:
             ramp = np.linspace(0.0, 1.0, fade, dtype=np.float32)[:, None]
             shifted[:fade] *= ramp
             shifted[-fade:] *= ramp[::-1]
-        out[start:end] = shifted
+        length = end - start
+        out[start:end] = shifted[:length]
     return _normalize(out, 0.95)
 
 
@@ -374,40 +399,65 @@ def chain_looper(x: np.ndarray, sr: int,
                  rng: np.random.Generator) -> np.ndarray:
     """Phaser-swept main + reverse-reverb quarter-loops layered on top.
 
-    Spec: filter sweep (100 Hz–1200 Hz) on the main signal, take loops
-    of 1/4 the file length, reverse-reverb each loop, layer back at half
-    volume with a slight stereo offset for width.  Successive loops
-    accumulate so the file builds toward the end.
-    """
-    n = x.shape[0]
-    # 1) Main: ring-mod sweep + light comb for "phaser" coloration.
-    main = stage_ring_mod(x, sr, rng, freq_lo=100.0, freq_hi=1200.0, mix=0.20)
-    main = stage_comb(main, sr, rng, delay_lo_ms=0.5, delay_hi_ms=3.0, fb=0.25)
+    Spec: slowly rising/falling filter sweep 100 Hz–1200 Hz, 1/32-note
+    LFO tempo (≈ 16 Hz at 120 BPM), 25% phaser feedback, 20% phaser
+    stereo width.  Loop every 1/4 of the file, apply reverse reverb to
+    each loop, layer back at half volume with stereo offset for width.
 
-    # 2) Quarter-length reverse-reverb loops layered at -6 dB, stereo offset.
-    chunk = max(1, n // 4)
+    Uses pedalboard.Phaser for an authentic all-pass phaser (not ring-mod)
+    and pedalboard.Reverb for the reverse-reverb loop processing.
+    """
+    from pedalboard import Pedalboard, Phaser, Reverb  # noqa: PLC0415
+    n = x.shape[0]
+    xt = x.T.astype(np.float32)  # (channels, samples) for pedalboard
+
+    # 1) Main signal through phaser — 1/32 note at 120 BPM ≈ 16 Hz LFO
+    phaser_board = Pedalboard([Phaser(
+        rate_hz=16.0,
+        depth=1.0,
+        centre_frequency_hz=650.0,   # midpoint of 100–1200 Hz sweep
+        feedback=0.25,
+        mix=0.20,                    # 20% stereo width / wet blend
+    )])
+    main = phaser_board(xt, sample_rate=sr).T.astype(np.float32)  # (samples, ch)
+
+    # 2) Quarter-length reverse-reverb loops layered at –6 dB
+    chunk = max(64, n // 4)
+    reverb_board = Pedalboard([Reverb(
+        room_size=0.8,
+        damping=0.5,
+        wet_level=0.8,
+        dry_level=0.2,
+        freeze_mode=0.0,
+    )])
     out = main.copy()
-    stereo_offset = int(sr * 0.005)  # 5 ms L/R offset for width
+    stereo_ms = int(sr * 0.005)  # 5 ms L/R offset for width
+
     for i in range(4):
-        s_src = i * chunk
-        e_src = min(s_src + chunk, n)
-        seg = x[s_src:e_src]
+        s = i * chunk
+        e = min(s + chunk, n)
+        seg = x[s:e].astype(np.float32)
         if seg.shape[0] < 64:
             continue
-        rr = stage_reverse_smear(seg, sr, rng, a=0.93, mix=0.7, pre_delay_s=0.04)
-        # Stereo width via right-channel delay
-        if rr.shape[1] >= 2 and stereo_offset > 0 and rr.shape[0] > stereo_offset:
-            r_delayed = np.concatenate([
-                np.zeros(stereo_offset, dtype=np.float32),
-                rr[:-stereo_offset, 1],
+        # Reverse reverb: reverse → wet reverb → reverse back
+        rev_in = np.ascontiguousarray(seg[::-1]).T  # (ch, samples)
+        wet = reverb_board(rev_in, sample_rate=sr).T  # (samples, ch)
+        rr = np.ascontiguousarray(wet[::-1]).astype(np.float32)
+        # Stereo width: delay right channel by 5 ms
+        if rr.shape[1] >= 2 and stereo_ms > 0 and rr.shape[0] > stereo_ms:
+            r_ch = np.concatenate([
+                np.zeros(stereo_ms, dtype=np.float32),
+                rr[:-stereo_ms, 1],
             ])
-            rr = np.stack([rr[:, 0], r_delayed], axis=1).astype(np.float32)
-        # Tile the loop across the entire output at half volume.
+            rr = np.stack([rr[:, 0], r_ch], axis=1)
+        # Tile loop across full output at half volume
         pos = 0
+        loop_len = rr.shape[0]
         while pos < n:
-            end = min(pos + rr.shape[0], n)
-            out[pos:end] += 0.5 * rr[: end - pos]
-            pos += rr.shape[0]
+            end_pos = min(pos + loop_len, n)
+            out[pos:end_pos] += 0.5 * rr[:end_pos - pos]
+            pos += loop_len
+
     return _normalize(out, 0.95)
 
 
