@@ -464,7 +464,7 @@ def chain_looper(x: np.ndarray, sr: int,
     # Reverse-reverb loops (1/4 file each), tiled from bar start, at -6 dB
     reverb_board = Pedalboard([Reverb(room_size=0.85, damping=0.4,
                                       wet_level=0.8,  dry_level=0.2)])
-    out      = main.copy()
+    loop_layer = np.zeros_like(main)   # loop accumulation separate from main
     chunk_n  = max(64, n // 4)
     smear_ms = int(sr * 0.005)
 
@@ -484,8 +484,18 @@ def chain_looper(x: np.ndarray, sr: int,
         pos = s
         while pos < n:
             ep = min(pos + rr.shape[0], n)
-            out[pos:ep] += 0.5 * rr[:ep - pos]
+            loop_layer[pos:ep] += 0.5 * rr[:ep - pos]
             pos += rr.shape[0]
+
+    # Smooth fade-out on the loop layer over the last loop-length so the
+    # final tiled repetition decays to silence instead of cutting off hard.
+    fade_len = min(chunk_n, n)
+    fade_start = n - fade_len
+    t_fade = np.linspace(0.0, np.pi / 2.0, fade_len, dtype=np.float32)
+    fade_env = np.cos(t_fade) ** 2          # 1 → 0 cosine curve
+    loop_layer[fade_start:] *= fade_env[:, None]
+
+    out = main + loop_layer
 
     return _normalize(out, 0.95)
 
