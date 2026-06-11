@@ -121,6 +121,25 @@ class AudioProcessor(QObject):
         self.chain_name: str | None = None  # set after run() succeeds
 
     def run(self) -> None:
+        # Initialize COM on this worker thread before any audio processing.
+        # Windows requires CoInitializeEx on every thread that calls into COM-
+        # backed audio APIs (WASAPI, DirectSound, JUCE, pedalboard).  Qt worker
+        # threads do NOT do this automatically; missing it causes JUCE to hit an
+        # assertion and call abort(), silently killing the process.
+        _co_token: int | None = None
+        if __import__("sys").platform == "win32":
+            try:
+                import ctypes
+                COINIT_MULTITHREADED = 0x0
+                hr = ctypes.windll.ole32.CoInitializeEx(None, COINIT_MULTITHREADED)
+                # S_OK (0) = initialized; S_FALSE (1) = already init on this thread.
+                # RPC_E_CHANGED_MODE (0x80010106) means it was already init as STA —
+                # that's fine, don't uninit in that case.
+                _co_token = int(hr) if hr in (0, 1) else None
+                _log.debug("CoInitializeEx hr=0x%08x token=%s", hr & 0xFFFFFFFF, _co_token)
+            except Exception:
+                _log.debug("CoInitializeEx unavailable", exc_info=True)
+
         try:
             _log.info("worker.run start: %s", self.input_path)
             audio = decode_to_numpy(self.input_path)
@@ -150,6 +169,13 @@ class AudioProcessor(QObject):
         except Exception as e:  # noqa: BLE001 — surface any DSP failure
             _log.exception("worker.run failed")
             self.failed.emit(f"{type(e).__name__}: {e}")
+        finally:
+            if _co_token is not None:
+                try:
+                    import ctypes
+                    ctypes.windll.ole32.CoUninitialize()
+                except Exception:
+                    pass
 
 
 def start_processor(input_path: Path, parent: QObject,

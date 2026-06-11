@@ -387,6 +387,9 @@ def chain_arpegiator(x: np.ndarray, sr: int,
     sigma    = step_len / 2.5       # Gaussian std ≈ half-step
 
     out = np.zeros_like(x, dtype=np.float64)
+    # Compute time axis once — reusing avoids 16 × 80 MB allocations (~1.3 GB
+    # wasted) for a 4-minute file, which previously froze and could OOM-crash.
+    t = np.arange(n, dtype=np.float64)
 
     for idx, semi in enumerate(pattern):
         board   = Pedalboard([PitchShift(semitones=float(semi))])
@@ -395,7 +398,6 @@ def chain_arpegiator(x: np.ndarray, sr: int,
 
         # Gaussian envelope centred at this step
         center = (idx + 0.5) * step_len
-        t      = np.arange(n, dtype=np.float64)
         env    = np.exp(-0.5 * ((t - center) / sigma) ** 2)
         out   += env[:, None] * shifted
 
@@ -403,7 +405,6 @@ def chain_arpegiator(x: np.ndarray, sr: int,
     env_sum = np.zeros(n, dtype=np.float64)
     for idx in range(n_steps):
         center   = (idx + 0.5) * step_len
-        t        = np.arange(n, dtype=np.float64)
         env_sum += np.exp(-0.5 * ((t - center) / sigma) ** 2)
     env_sum = np.maximum(env_sum, 1e-9)
     out = (out / env_sum[:, None]).astype(np.float32)
@@ -506,6 +507,16 @@ def chain_looper(x: np.ndarray, sr: int,
 
 
 # Registry: name -> function. Order doesn't matter; selection is random.
+#
+# NOTE: chain_arpegiator and chain_looper are NOT in this registry.
+# Both import pedalboard (JUCE) inside the worker thread, which requires
+# CoInitializeEx on the calling thread on Windows — Qt worker threads do not
+# set this up, causing JUCE to hit an assertion and call abort(), silently
+# killing the process mid-chew.  chain_arpegiator also allocates ~1.3 GB of
+# temporaries for a 4-minute file (np.arange(n) called 16× inside loops),
+# which can trigger an OOM crash in numpy's C layer before Python's except
+# can catch it.  Both chains remain defined above and are still accessible via
+# the CLI (--chain arpegiator / --chain looper) for experimentation.
 CHAINS: dict[str, Callable[[np.ndarray, int, np.random.Generator], np.ndarray]] = {
     "standard_mauling": chain_standard_mauling,
     "wet_slobber":      chain_wet_slobber,
@@ -513,8 +524,13 @@ CHAINS: dict[str, Callable[[np.ndarray, int, np.random.Generator], np.ndarray]] 
     "pulper":           chain_pulper,
     "stomach_acid":     chain_stomach_acid,
     "comb_riser":       chain_comb_riser,
-    "arpegiator":       chain_arpegiator,
-    "looper":           chain_looper,
+}
+
+# Experimental chains — require pedalboard; NOT in the random-selection pool.
+# Use via CLI: python -m carpeteater.audio_fx input.wav out.wav --chain arpegiator
+_EXPERIMENTAL_CHAINS: dict[str, Callable[[np.ndarray, int, np.random.Generator], np.ndarray]] = {
+    "arpegiator": chain_arpegiator,
+    "looper":     chain_looper,
 }
 
 
@@ -535,16 +551,17 @@ def chew(audio: np.ndarray, sr: int = 44100,
     ss = np.random.SeedSequence(seed)
     chain_seed, dsp_seed = ss.generate_state(2, dtype=np.uint32)
 
+    _all = {**CHAINS, **_EXPERIMENTAL_CHAINS}
     if chain is None:
         chain_rng = np.random.default_rng(int(chain_seed))
         names = sorted(CHAINS.keys())
         chain = names[int(chain_rng.integers(0, len(names)))]
-    elif chain not in CHAINS:
-        raise ValueError(f"unknown chain {chain!r}; available: {list(CHAINS)}")
+    elif chain not in _all:
+        raise ValueError(f"unknown chain {chain!r}; available: {list(_all)}")
 
     rng = np.random.default_rng(int(dsp_seed))
     x = _ensure_stereo(audio)
-    x = CHAINS[chain](x, sr, rng)
+    x = _all[chain](x, sr, rng)
     x = _normalize(x, 0.95)
     return chain, x
 
@@ -561,14 +578,19 @@ def _cli(argv: list[str]) -> int:
     parser.add_argument("output", type=Path)
     parser.add_argument("--seed", type=int, default=None,
                         help="Deterministic seed (default: derived from file).")
-    parser.add_argument("--chain", choices=sorted(CHAINS.keys()), default=None,
+    _all_chains = sorted({**CHAINS, **_EXPERIMENTAL_CHAINS}.keys())
+    parser.add_argument("--chain", choices=_all_chains, default=None,
                         help="Force a specific chain (default: random per seed).")
     parser.add_argument("--list-chains", action="store_true")
     args = parser.parse_args(argv)
 
     if args.list_chains:
+        print("Stable chains (randomly selected):")
         for name in sorted(CHAINS):
-            print(name)
+            print(f"  {name}")
+        print("Experimental chains (pedalboard; CLI only):")
+        for name in sorted(_EXPERIMENTAL_CHAINS):
+            print(f"  {name}")
         return 0
 
     from .processor import decode_to_numpy, seed_for_file, write_wav

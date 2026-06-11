@@ -7,6 +7,31 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- **Root cause of "freeze before spit animation" crash.** Two independent crash vectors,
+  both triggered by `chain_arpegiator` or `chain_looper` being randomly selected (25% of
+  all chews):
+
+  1. **JUCE `abort()` via missing COM initialization.** Both chains import `pedalboard`
+     (which wraps JUCE) inside the Qt worker thread. Windows requires `CoInitializeEx` on
+     every thread before calling into COM-backed audio APIs (WASAPI, DirectSound, JUCE).
+     Qt worker threads do not set this up. JUCE detected the missing apartment and called
+     `abort()`, killing the process silently — before any Python `except` could catch it,
+     and before the SPITTING animation ever fired. Fixed by:
+     - Removing `arpegiator` and `looper` from the random `CHAINS` pool. They are still
+       defined and accessible via `--chain arpegiator / --chain looper` on the CLI.
+     - Adding `CoInitializeEx(COINIT_MULTITHREADED)` at the top of `AudioProcessor.run()`
+       as defense-in-depth for any future pedalboard usage in the worker thread, with a
+       matching `CoUninitialize()` in a `finally` block.
+
+  2. **OOM crash in `chain_arpegiator` on 4-minute files.** `np.arange(n, dtype=float64)`
+     was called 16 times inside two nested loops. For a 4-minute file (10 M samples) each
+     call allocates 80 MB, totalling ~1.3 GB of throwaway temporaries on top of the working
+     buffers. NumPy's C layer can raise `MemoryError` after partial allocation, before Python
+     can catch it — also producing a silent process exit. Fixed by moving the single
+     `t = np.arange(n, dtype=np.float64)` computation outside both loops (58% peak-memory
+     reduction, ~700 MB → ~290 MB savings).
+
 ### Build system overhaul
 - **`run.py`** — one-command source runner. `python run.py` checks Python version, creates `.venv\`, installs the project, downloads `vendor\ffmpeg.exe` on first run, creates a desktop shortcut (`Carpet Eater.lnk` via `pythonw.exe` — no CMD window), then launches the GUI. Zero manual setup. Replaces the old `python -m venv` / `pip install -r requirements.txt` / "go fetch ffmpeg from gyan.dev" sequence.
 - **`build.py`** — one-command build pipeline. `python build.py` produces `dist\CarpetEater.exe`, `installer\Output\CarpetEater-Setup.exe`, and `release\CarpetEater-Portable.zip` in a single step. Auto-bootstraps venv, auto-downloads ffmpeg, generates `build_icon.ico` inline, runs PyInstaller, runs Inno Setup if available (skips with a friendly note otherwise), zips the portable. Replaces `build.bat` + `make_icon.py` + manual `iscc` invocation.
