@@ -427,7 +427,7 @@ def chain_looper(x: np.ndarray, sr: int,
     n, n_ch = x.shape
 
     # Very subtle LP sweep — barely audible but present (10 % wet)
-    block, lp_mix = 2048, 0.10
+    block, lp_mix = 2048, 0.30
     main_lpf = np.zeros_like(x, dtype=np.float32)
     zi = None
     for i in range(0, n, block):
@@ -449,18 +449,18 @@ def chain_looper(x: np.ndarray, sr: int,
     main = (1 - lp_mix) * x + lp_mix * main_lpf
 
     # Gentle phaser for PanShaper-style stereo movement
-    ph = Pedalboard([Phaser(rate_hz=0.5, depth=0.5, centre_frequency_hz=650.0,
-                            feedback=0.25, mix=0.10)])
+    ph = Pedalboard([Phaser(rate_hz=0.5, depth=1.0, centre_frequency_hz=650.0,
+                            feedback=0.50, mix=0.40)])
     main = ph(main.T.astype(np.float32), sample_rate=sr).T.astype(np.float32)
 
     # Reverse-reverb loops (1/4 file each), tiled from bar start, at -6 dB
-    reverb_board = Pedalboard([Reverb(room_size=0.65, damping=0.5,
-                                      wet_level=0.35, dry_level=0.65)])
+    reverb_board = Pedalboard([Reverb(room_size=0.85, damping=0.3,
+                                      wet_level=0.70, dry_level=0.30)])
     loop_layer = np.zeros_like(main)   # loop accumulation separate from main
     chunk_n  = max(64, n // 4)
     smear_ms = int(sr * 0.005)
 
-    for i in range(4):
+    for i in range(8):
         s, e = i * chunk_n, min((i + 1) * chunk_n, n)
         seg  = x[s:e].astype(np.float32)
         if seg.shape[0] < 64:
@@ -472,7 +472,7 @@ def chain_looper(x: np.ndarray, sr: int,
         # Make rr circular: crossfade the last 1 s back into the first 1 s.
         # This eliminates the quiet tail → loud head jump at every tile seam
         # without shortening the loop (which made it sound choppy).
-        xfade    = min(int(sr * 1.0), rr.shape[0] // 4)
+        xfade    = min(int(sr * 1.5), rr.shape[0] // 4)
         fade_out = np.linspace(1.0, 0.0, xfade, dtype=np.float32)[:, None]
         fade_in  = np.linspace(0.0, 1.0, xfade, dtype=np.float32)[:, None]
         rr[-xfade:] = rr[-xfade:] * fade_out + rr[:xfade] * fade_in
@@ -488,7 +488,7 @@ def chain_looper(x: np.ndarray, sr: int,
             tile = rr[:ep - pos].copy()
             if ti == 0 and fi_n > 1 and len(tile) > fi_n:
                 tile[:fi_n] *= fi_env
-            loop_layer[pos:ep] += 0.5 * tile
+            loop_layer[pos:ep] += 0.85 * tile
             pos += rr.shape[0]
             ti  += 1
 
