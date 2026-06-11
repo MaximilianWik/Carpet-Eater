@@ -320,58 +320,50 @@ def chain_stomach_acid(x: np.ndarray, sr: int,
 
 def chain_comb_riser(x: np.ndarray, sr: int,
                      rng: np.random.Generator) -> np.ndarray:
-    """Single smooth comb sweep from ~200 Hz to 1210 Hz over the file.
+    """Feedforward FIR comb sweep — smooth rise without metallic resonance.
 
-    One monotonic rise, no LFO oscillation — the resonant frequency
-    climbs once across the full duration.  Mixed 40% wet so it enhances
-    without overriding the source.  fb=0.92 throughout.
+    IIR feedback combs ring like a metal pipe (the "can" sound).
+    FIR feedforward comb  y[n] = x[n] + fb * x[n-D]  creates the same
+    sweeping comb coloration without any resonant buildup.
+
+    D sweeps from 441 samples (100 Hz) down to 36 (1210 Hz) over 64 chunks.
+    fb also rises from 0.30 → 0.85 so the effect builds gradually.
+    Mixed 35 % wet so the source always stays clearly audible.
     """
-    from scipy.signal import lfilter  # noqa: PLC0415
     n, n_ch = x.shape
-    fb       = 0.92
-    freq_lo  = 200.0   # start resonance (near source fundamental)
-    freq_hi  = 1210.0  # end  resonance (spec target)
-    n_chunks = 64      # number of steps in the sweep
-    chunk_n  = max(1, (n + n_chunks - 1) // n_chunks)
+    fb_lo   = 0.30
+    fb_hi   = 0.85
+    D_start = max(1, int(round(sr / 100.0)))    # 441 samples — 100 Hz
+    D_end   = max(1, int(round(sr / 1210.0)))   #  36 samples — 1210 Hz
+    n_ch_   = n_ch
+    n_chunks = 64
+    chunk_n  = max(D_start, (n + n_chunks - 1) // n_chunks)
 
-    a_base = np.zeros(1, dtype=np.float64)  # placeholder; rebuilt per chunk
+    ibuf = np.zeros((D_start, n_ch_), dtype=np.float64)
+    out  = np.zeros_like(x, dtype=np.float32)
 
-    out   = np.zeros_like(x, dtype=np.float32)
-    prev  = np.zeros((0, n_ch), dtype=np.float64)   # running output buffer
+    ci, i = 0, 0
+    while i < n:
+        e       = min(i + chunk_n, n)
+        seg     = x[i:e].astype(np.float64)
+        seg_len = e - i
 
-    i = 0
-    for ci in range(n_chunks):
-        e   = min(i + chunk_n, n)
-        seg = x[i:e].astype(np.float64)
+        prog = ci / max(1, n_chunks - 1)                    # 0 → 1
+        D    = max(D_end, int(round(D_start - (D_start - D_end) * prog)))
+        fb   = fb_lo + (fb_hi - fb_lo) * prog
 
-        prog = ci / max(1, n_chunks - 1)
-        fc   = freq_lo + (freq_hi - freq_lo) * prog          # linear sweep
-        D    = max(1, int(round(sr / fc)))
-
-        b = np.zeros(D + 1, dtype=np.float64); b[0] = 1.0
-        a = np.zeros(D + 1, dtype=np.float64); a[0] = 1.0; a[D] = -fb
-
-        # Build zi from last D samples of previous output (state continuity)
-        if prev.shape[0] >= D:
-            zi_src = prev[-D:]
-        else:
-            zi_src = np.vstack([np.zeros((D - prev.shape[0], n_ch),
-                                         dtype=np.float64), prev])
-
-        y = np.zeros_like(seg)
-        for ch in range(n_ch):
-            y[:, ch], _ = lfilter(b, a, seg[:, ch], zi=zi_src[:, ch])
+        # Delayed version x[t-D] built from history buffer + current chunk
+        extended = np.vstack([ibuf, seg])                    # (D_start+seg_len, n_ch)
+        delayed  = extended[D_start - D : D_start + seg_len - D]
+        y        = seg + fb * delayed
 
         out[i:e] = y.astype(np.float32)
+        ibuf[:]  = extended[-D_start:]                       # roll history
+        ci += 1
+        i   = e
 
-        # Update rolling buffer
-        prev = np.vstack([prev, y])[-max(D, 1):]
-        i = e
-
-    # Mix 40% wet — preserves the source, adds the rising metallic resonance
-    mixed = 0.60 * x + 0.40 * out
+    mixed = 0.65 * x + 0.35 * out
     return _normalize(mixed, 0.95)
-
 
 def chain_arpegiator(x: np.ndarray, sr: int,
                      rng: np.random.Generator) -> np.ndarray:
